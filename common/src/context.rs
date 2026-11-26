@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::platform::{Family, Platform};
 use crate::report::Reporter;
 
 /// Зовнішня команда: програма, аргументи та додаткові змінні середовища.
@@ -20,6 +21,8 @@ pub struct Cmd {
     envs: Vec<(String, String)>,
     show_stderr: bool,
     keep_stdin: bool,
+    /// Ненульові коди, що теж означають успіх.
+    ok_codes: Vec<i32>,
 }
 
 impl Cmd {
@@ -33,6 +36,7 @@ impl Cmd {
             envs: Vec::new(),
             show_stderr: true,
             keep_stdin: false,
+            ok_codes: Vec::new(),
         }
     }
 
@@ -59,6 +63,12 @@ impl Cmd {
     /// Залишити термінал на stdin (наприклад, для запиту пароля).
     pub fn interactive(mut self) -> Self {
         self.keep_stdin = true;
+        self
+    }
+
+    /// Коди завершення понад нуль, які для цієї програми означають успіх.
+    pub fn ok_codes(mut self, codes: &[i32]) -> Self {
+        self.ok_codes.extend_from_slice(codes);
         self
     }
 
@@ -100,6 +110,10 @@ pub struct Context {
     pub notes: Vec<String>,
     /// Віконна програма для пароля sudo, коли термінала немає.
     pub askpass: Option<PathBuf>,
+    /// Що це за комп'ютер; визначає, які системні джерела доступні.
+    pub platform: Platform,
+    /// Чи є на stdin термінал.
+    pub terminal: bool,
     interrupted: Arc<AtomicBool>,
     reporter: Box<dyn Reporter>,
 }
@@ -109,24 +123,14 @@ impl Context {
         // Щоб працювати однаково з fish, bash, cron чи ярлика.
         let mut dirs: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
-        let extra = [
-            home.join(".local/bin"),
-            PathBuf::from("/home/linuxbrew/.linuxbrew/bin"),
-            home.join("go/bin"),
-            home.join(".composer/vendor/bin"),
-            home.join(".opencode/bin"),
-            home.join(".mimocode/bin"),
-            home.join(".cargo/bin"),
-            home.join(".bun/bin"),
-        ];
-        for dir in extra {
+        for dir in extra_dirs(&home) {
             if dir.is_dir() && !dirs.contains(&dir) {
                 dirs.push(dir);
             }
         }
         let path = std::env::join_paths(dirs).unwrap_or_default();
 
-        Context {
+        let mut ctx = Context {
             home,
             path,
             dry,
@@ -134,9 +138,18 @@ impl Context {
             failed_commands: Vec::new(),
             notes: Vec::new(),
             askpass: None,
+            platform: Platform::default(),
+            terminal: std::io::stdin().is_terminal(),
             interrupted: Arc::new(AtomicBool::new(false)),
             reporter,
-        }
+        };
+        ctx.platform = Platform::detect(|program| ctx.have(program));
+        ctx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_path(&mut self, dir: PathBuf) {
+        self.path = dir.into_os_string();
     }
 
     /// Прапорець переривання: інтерфейс виставляє його по Ctrl+C чи кнопці
@@ -176,7 +189,7 @@ impl Context {
 
     /// Чи можуть сторонні програми запитувати щось у користувача.
     pub fn interactive(&self) -> bool {
-        !self.reporter.captures_output() && std::io::stdin().is_terminal()
+        !self.reporter.captures_output() && self.terminal
     }
 
     fn command(&self, cmd: &Cmd) -> Command {
@@ -248,12 +261,18 @@ impl Context {
 
     /// Виконує команду (у --dry-run лише показує). Невдачі запам'ятовує.
     pub fn run(&mut self, cmd: &Cmd) -> bool {
+        self.run_status(cmd).is_some()
+    }
+
+    /// Як `run`, але повертає код успішного завершення: нуль або один із
+    /// `ok_codes`. `None` — невдача.
+    pub fn run_status(&mut self, cmd: &Cmd) -> Option<i32> {
         if self.interrupted() {
-            return false;
+            return None;
         }
         self.reporter.command(&cmd.display(), false);
         if self.dry {
-            return true;
+            return Some(0);
         }
         let status = if self.reporter.captures_output() {
             self.stream(cmd)
@@ -281,7 +300,7 @@ impl Context {
             }
             command.status()
         };
-        self.record(cmd, status)
+        self.record(cmd, status).is_some()
     }
 
     /// Виконує команду, передаючи її вивід у `Reporter::log` рядок за рядком.
@@ -321,10 +340,11 @@ impl Context {
         }
     }
 
-    fn record(&mut self, cmd: &Cmd, status: std::io::Result<ExitStatus>) -> bool {
+    fn record(&mut self, cmd: &Cmd, status: std::io::Result<ExitStatus>) -> Option<i32> {
         let problem = match status {
-            Ok(status) if status.success() => return true,
+            Ok(status) if status.success() => return Some(0),
             Ok(status) => match status.code() {
+                Some(code) if cmd.ok_codes.contains(&code) => return Some(code),
                 Some(code) => format!("команда завершилась з кодом {code}"),
                 None => "команду перервано".to_string(),
             },
@@ -332,7 +352,7 @@ impl Context {
         };
         self.failed_commands.push(cmd.display());
         self.reporter.failure(&problem);
-        false
+        None
     }
 
     /// `sudo` лише тоді, коли поточний користувач не може писати в каталог.
@@ -351,12 +371,20 @@ impl Context {
         self.capture(&test).ok()
     }
 
-    /// Чи належить файл пакунку RPM (тоді його оновлює DNF).
-    pub fn rpm_owned(&self, path: &Path) -> bool {
-        if !self.have("rpm") {
+    /// Чи належить файл пакунку менеджера цього дистрибутива (тоді його
+    /// оновлює він).
+    pub fn distro_owned(&self, path: &Path) -> bool {
+        let query: &[&str] = match self.platform.family {
+            Some(Family::Rpm | Family::Suse) => &["rpm", "-qf"],
+            Some(Family::Debian) => &["dpkg-query", "-S"],
+            Some(Family::Arch) => &["pacman", "-Qo"],
+            Some(Family::Alpine) => &["apk", "info", "--who-owns"],
+            None => return false,
+        };
+        if !self.have(query[0]) {
             return false;
         }
-        let query = Cmd::new(["rpm", "-qf"])
+        let query = Cmd::new(query.iter().copied())
             .args([path.display().to_string()])
             .quiet();
         self.capture(&query).ok()
@@ -395,19 +423,51 @@ fn forward_lines(mut stream: impl Read + Send + 'static, sender: mpsc::Sender<St
     });
 }
 
+/// Каталоги з програмами, яких може не бути в `PATH` інтерфейсу.
+fn extra_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".local/bin"),
+        PathBuf::from("/home/linuxbrew/.linuxbrew/bin"),
+        home.join("go/bin"),
+        home.join(".composer/vendor/bin"),
+        home.join(".opencode/bin"),
+        home.join(".mimocode/bin"),
+        home.join(".cargo/bin"),
+        home.join(".bun/bin"),
+        home.join(".nix-profile/bin"),
+        home.join(".local/state/nix/profiles/profile/bin"),
+        PathBuf::from("/nix/var/nix/profiles/default/bin"),
+    ]
+}
+
+/// Де дистрибутиви кладуть віконного помічника sudo, за пріоритетом.
+const ASKPASS_HELPERS: [&str; 9] = [
+    "/usr/bin/ksshaskpass",
+    // Fedora, RHEL.
+    "/usr/libexec/openssh/ssh-askpass",
+    "/usr/libexec/openssh/gnome-ssh-askpass",
+    // Debian, Ubuntu.
+    "/usr/bin/ssh-askpass",
+    "/usr/lib/openssh/gnome-ssh-askpass",
+    // Arch, openSUSE, Alpine.
+    "/usr/lib/ssh/ssh-askpass",
+    "/usr/lib/ssh/x11-ssh-askpass",
+    "/usr/lib/ssh/gnome-ssh-askpass",
+    "/usr/libexec/ssh/ssh-askpass",
+];
+
 /// Віконна програма для запиту пароля, якщо така є.
 pub fn find_askpass() -> Option<PathBuf> {
-    std::env::var_os("SUDO_ASKPASS")
-        .map(PathBuf::from)
+    first_helper(
+        std::env::var_os("SUDO_ASKPASS").map(PathBuf::from),
+        &ASKPASS_HELPERS.map(PathBuf::from),
+    )
+}
+
+fn first_helper(configured: Option<PathBuf>, known: &[PathBuf]) -> Option<PathBuf> {
+    configured
         .into_iter()
-        .chain(
-            [
-                "/usr/bin/ksshaskpass",
-                "/usr/libexec/openssh/ssh-askpass",
-                "/usr/libexec/openssh/gnome-ssh-askpass",
-            ]
-            .map(PathBuf::from),
-        )
+        .chain(known.iter().cloned())
         .find(|path| is_executable(path))
 }
 
@@ -441,6 +501,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::testing::Host;
 
     #[derive(Clone, Default)]
     struct Window(Arc<Mutex<String>>);
@@ -500,6 +561,88 @@ mod tests {
         let (mut ctx, _) = context();
         assert!(!ctx.run(&shell("exit 3")));
         assert_eq!(ctx.failed_commands.len(), 1);
+    }
+
+    #[test]
+    fn declared_exit_codes_are_successes() {
+        let (mut ctx, _) = context();
+        let reboot = shell("exit 102").ok_codes(&[102, 103]);
+        assert_eq!(ctx.run_status(&reboot), Some(102));
+        assert!(ctx.run(&reboot));
+        assert!(ctx.failed_commands.is_empty());
+        assert_eq!(ctx.run_status(&shell("exit 1").ok_codes(&[102])), None);
+        assert_eq!(ctx.run_status(&shell("true")), Some(0));
+        assert_eq!(ctx.failed_commands.len(), 1);
+        ctx.dry = true;
+        assert_eq!(ctx.run_status(&shell("exit 1")), Some(0));
+    }
+
+    #[test]
+    fn ownership_is_asked_of_the_native_manager() {
+        for (release, tool, query) in [
+            ("ID=fedora\n", "rpm", "rpm -qf"),
+            ("ID=opensuse-leap\n", "rpm", "rpm -qf"),
+            ("ID=debian\n", "dpkg-query", "dpkg-query -S"),
+            ("ID=arch\n", "pacman", "pacman -Qo"),
+            ("ID=alpine\n", "apk", "apk info --who-owns"),
+        ] {
+            let mut host = Host::new(release);
+            host.stub(tool, "case \"$*\" in *owned*) exit 0 ;; esac; exit 1");
+            assert!(host.ctx.distro_owned(Path::new("/x/owned")), "{release}");
+            assert!(!host.ctx.distro_owned(Path::new("/x/other")), "{release}");
+            assert_eq!(host.calls()[0], format!("{query} /x/owned"));
+        }
+    }
+
+    #[test]
+    fn nothing_is_owned_without_a_native_family() {
+        let mut host = Host::new("ID=nixos\n");
+        host.stub("rpm", "exit 0").stub("dpkg-query", "exit 0");
+        assert!(!host.ctx.distro_owned(Path::new("/x")));
+        assert!(host.calls().is_empty());
+        // Сімейство є, а менеджера немає.
+        let host = Host::new("ID=debian\n");
+        assert!(!host.ctx.distro_owned(Path::new("/x")));
+    }
+
+    #[test]
+    fn nix_profiles_are_searched_from_any_launcher() {
+        let host = Host::new("");
+        let bin = host.dir.join("home/.nix-profile/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("upm-test-nix"), "").unwrap();
+        std::fs::set_permissions(
+            bin.join("upm-test-nix"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let ctx = Context::new(
+            host.dir.join("home"),
+            false,
+            false,
+            Box::new(Window::default()),
+        );
+        assert!(ctx.have("upm-test-nix"));
+        assert!(extra_dirs(Path::new("/h")).contains(&"/nix/var/nix/profiles/default/bin".into()));
+    }
+
+    #[test]
+    fn askpass_prefers_the_configured_helper() {
+        let sh = PathBuf::from("/bin/sh");
+        let ls = PathBuf::from("/bin/ls");
+        let missing = PathBuf::from("/nonexistent/askpass");
+        assert_eq!(first_helper(Some(sh.clone()), &[ls.clone()]), Some(sh));
+        assert_eq!(first_helper(Some(missing.clone()), &[ls.clone()]), Some(ls.clone()));
+        assert_eq!(first_helper(None, &[missing, ls.clone()]), Some(ls));
+        // Debian, Arch та openSUSE кладуть помічника в інші місця.
+        for path in [
+            "/usr/bin/ssh-askpass",
+            "/usr/lib/ssh/ssh-askpass",
+            "/usr/lib/ssh/x11-ssh-askpass",
+            "/usr/lib/openssh/gnome-ssh-askpass",
+        ] {
+            assert!(ASKPASS_HELPERS.contains(&path), "{path}");
+        }
     }
 
     #[test]

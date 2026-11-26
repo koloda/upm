@@ -1,0 +1,3 @@
+NAME="openSUSE MicroOS"
+ID="opensuse-microos"
+ID_LIKE="suse opensuse opensuse-tumbleweed"

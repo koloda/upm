@@ -118,8 +118,11 @@ pub fn usage(program: &str) -> String {
   -h, --help         ця довідка
 
 Джерела: {all}
-Синоніми: node/nodejs=npm, py/pip=python, cargo=rust, rpm=dnf, golang=go,
-          homebrew=brew, appimages=appimage, sdk=sdkman
+Показуються лише ті, що є на цьому комп'ютері; пакунки дистрибутива — тільки
+для вашої системи.
+Синоніми: node/nodejs=npm, py/pip=python, cargo=rust, golang=go, homebrew=brew,
+          appimages=appimage, sdk=sdkman, deb/dpkg=apt,
+          rpm — RPM-джерело цього комп'ютера (dnf, yum, zypper чи rpm)
 
 Приклади:
   {program} list                    # усе встановлене
@@ -177,5 +180,24 @@ mod tests {
         assert!(run("upgrade --firmware").scope.in_scope("firmware"));
         assert!(run("upgrade firmware:SSD").scope.in_scope("firmware"));
         assert!(run("list --only firmware").scope.in_scope("firmware"));
+    }
+
+    #[test]
+    fn rpm_and_debian_words_are_sources() {
+        // Яке саме RPM-джерело — вирішує комп'ютер уже після розбору.
+        let request = run("upgrade rpm deb:firefox");
+        assert_eq!(request.scope.sources, ["rpm"]);
+        assert_eq!(request.scope.targets[0].source, Some("apt"));
+    }
+
+    #[test]
+    fn help_names_every_source_and_synonym() {
+        let help = usage("upm");
+        for word in sources::NAMES {
+            assert!(help.contains(word), "{word}");
+        }
+        assert!(help.contains("deb/dpkg=apt"), "{help}");
+        assert!(!help.contains("rpm=dnf"), "{help}");
+        assert!(help.contains("rpm — RPM-джерело цього комп'ютера"), "{help}");
     }
 }

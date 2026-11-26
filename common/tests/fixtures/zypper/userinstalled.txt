@@ -1,0 +1,29 @@
+Loading repository data...
+Warning: Repository 'Update repository of openSUSE Backports' metadata expired since 2026-07-10 11:19:15 UTC.
+Warning: Repository 'Main Update Repository' metadata expired since 2026-10-13 22:33:04 UTC.
+
+    Warning: Repository metadata expired: Check if 'autorefresh' is turned on (zypper lr), otherwise
+    manually refresh the repository (zypper ref). If this does not solve the issue, it could be that
+    you are using a broken mirror or the server has actually discontinued to support the repository.
+
+Reading installed packages...
+S  | Repository                                                   | Name                              | Version                                  | Arch
+---+--------------------------------------------------------------+-----------------------------------+------------------------------------------+-------
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | aaa_base                          | 84.87+git20180409.04c9dae-150300.10.28.2 | x86_64
+i+ | Main Repository                                              | ca-certificates                   | 2+git20240416.98ae794-150300.4.3.3       | noarch
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | ca-certificates-mozilla           | 2.84-150200.44.1                         | noarch
+i+ | Main Repository                                              | cracklib-dict-small               | 2.9.11-150600.1.90                       | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | curl                              | 8.14.1-150600.4.40.1                     | x86_64
+i+ | Main Repository                                              | filesystem                        | 15.0-11.8.1                              | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | glibc                             | 2.38-150600.14.46.1                      | x86_64
+i+ | Main Repository                                              | kubic-locale-archive              | 2.38-150600.18.3                         | noarch
+i+ | Main Repository                                              | netcfg                            | 11.6-150000.3.6.1                        | noarch
+i+ | Main Repository                                              | openSUSE-build-key                | 1.0-lp156.8.2                            | noarch
+i+ | Main Update Repository                                       | openSUSE-release                  | 15.6-lp156.417.4.1                       | x86_64
+i+ | Main Update Repository                                       | openSUSE-release-appliance-docker | 15.6-lp156.417.4.1                       | x86_64
+i+ | Main Update Repository                                       | patterns-base-fips                | 20200505-lp156.17.3.1                    | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | procps                            | 3.3.17-150000.7.42.1                     | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | rpm-ndb                           | 4.14.3-150400.59.16.1                    | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | shadow                            | 4.17.2-150600.17.18.1                    | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | timezone                          | 2025b-150600.91.6.2                      | x86_64
+i+ | Update repository with updates from SUSE Linux Enterprise 15 | zypper                            | 1.14.94-150600.10.52.1                   | x86_64

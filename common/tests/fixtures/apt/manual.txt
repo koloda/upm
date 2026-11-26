@@ -1,0 +1,4 @@
+bash
+hello
+liblzma5
+liblzma5:i386

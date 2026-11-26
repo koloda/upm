@@ -315,6 +315,7 @@ Page {
 
             RowLayout {
                 Label {
+                    objectName: "statusLabel"
                     Layout.fillWidth: true
                     text: root.closeWarning !== "" ? root.closeWarning : root.backend.status
                     font.bold: root.closeWarning !== ""

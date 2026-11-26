@@ -9,11 +9,15 @@
 pub mod catalog;
 pub mod context;
 pub mod engine;
+pub mod platform;
 pub mod report;
 pub mod scope;
 pub mod source;
 pub mod sources;
 pub mod version;
+
+#[cfg(test)]
+mod testing;
 
 /// Чи запущено з правами root (наприклад, через sudo). Тоді brew, npm, go
 /// тощо працювали б не для того користувача.

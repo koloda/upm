@@ -89,7 +89,7 @@ fn npm_packages(ctx: &Context) -> Vec<NpmPackage> {
         for dir in dirs {
             let manifest = dir.join("package.json");
             // Символічне посилання — це `npm link`, тобто локальний проєкт.
-            if dir.is_symlink() || !manifest.is_file() || ctx.rpm_owned(&manifest) {
+            if dir.is_symlink() || !manifest.is_file() || ctx.distro_owned(&manifest) {
                 continue;
             }
             let json = std::fs::read_to_string(&manifest)

@@ -11,12 +11,13 @@ Item {
     QtObject {
         id: fake
 
-        property string sourcesJson: JSON.stringify([
+        readonly property string defaultSources: JSON.stringify([
             { id: "", title: "All", installed: 4, updates: 1, failed: false },
             { id: "npm", title: "Node", installed: 2, updates: 1, failed: false },
             { id: "go", title: "Go", installed: 1, updates: 0, failed: false },
             { id: "manual", title: "Вручну", installed: 1, updates: 0, failed: false }
         ])
+        property string sourcesJson: defaultSources
         property string rowsJson: ""
         property string currentSource: ""
         property bool onlyUpgradable: false
@@ -70,6 +71,8 @@ Item {
         }
 
         function reset() {
+            sourcesJson = defaultSources
+            status = "Готово"
             rowsJson = JSON.stringify([
                 { source: "npm", sourceTitle: "Node", key: "codex", name: "codex", current: "1", latest: "2", state: "upgradable", info: "", removable: true },
                 { source: "npm", sourceTitle: "Node", key: "cline", name: "cline", current: "3", latest: "", state: "current", info: "", removable: true },
@@ -354,6 +357,30 @@ Item {
             tryVerify(() => child("rowList").count === 3)
             verify(!fake.busy)
             compare(fake.log, "- sudo dnf remove codex\n")
+        }
+
+        // Бекенд віддає лише джерела цього комп'ютера — вікно показує саме їх.
+        function test_sidebar_shows_only_the_hosts_sources() {
+            fake.sourcesJson = JSON.stringify([
+                { id: "", title: "All", installed: 3, updates: 0, failed: false },
+                { id: "apt", title: "APT", installed: 2, updates: 0, failed: false },
+                { id: "snap", title: "Snap", installed: 1, updates: 0, failed: false }
+            ])
+            const list = child("sourceList")
+            tryCompare(list, "count", 3)
+            list.forceLayout()
+            const titles = []
+            for (let i = 0; i < list.count; i++)
+                titles.push(list.itemAtIndex(i).modelData.title)
+            compare(titles, ["All", "APT", "Snap"])
+            mouseClick(list.itemAtIndex(1))
+            compare(fake.calls, ["source:apt"])
+            compare(child("upgradeButton").text, "Upgrade усе: APT")
+        }
+
+        function test_status_names_skipped_sources() {
+            fake.status = "Оновлення: пропущено Pacman. Деталі в журналі"
+            compare(child("statusLabel").text, "Оновлення: пропущено Pacman. Деталі в журналі")
         }
     }
 }

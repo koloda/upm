@@ -76,7 +76,12 @@ fn show_check(check: &SourceCheck) {
         ));
     }
     if !check.targeted && check.updates.is_empty() && !check.failed && check.source != "manual" {
-        output::info("оновлень не знайдено");
+        // Те, що не вдалося перевірити, не можна називати актуальним.
+        if check.unchecked.is_empty() {
+            output::info("оновлень не знайдено");
+        } else {
+            output::info(&format!("перевірити нема чим: {}", check.unchecked.len()));
+        }
     }
 }
 

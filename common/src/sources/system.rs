@@ -1,4 +1,4 @@
-//! Системні джерела: DNF, Flatpak, Homebrew, AppImage, прошивки.
+//! Системні джерела поза дистрибутивом: Flatpak, Homebrew, AppImage, прошивки.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use crate::context::{Cmd, Context};
 use crate::source::{Item, Pick, Query, Source, Status, Update};
+use crate::sources::run_removals;
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
@@ -17,134 +18,6 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
-}
-
-/// Виконує дібрані команди видалення; після скасування нові не запускає.
-fn run_removals(ctx: &mut Context, commands: Vec<Cmd>) -> Status {
-    let total = commands.len();
-    let mut success = true;
-    let mut done = 0;
-    for cmd in &commands {
-        if ctx.interrupted() {
-            break;
-        }
-        done += 1;
-        success &= ctx.run(cmd);
-    }
-    if done == 0 {
-        Status::Skipped
-    } else if done < total {
-        Status::Failed
-    } else {
-        Status::from_success(success)
-    }
-}
-
-// ---------------------------------------------------------------- DNF
-pub struct Dnf;
-
-/// Рядки "name.arch evr repo" з виводу `dnf check-upgrade`.
-fn parse_check_upgrade(listing: &str) -> Vec<(&str, &str)> {
-    listing
-        .lines()
-        .take_while(|line| !line.starts_with("Obsolet"))
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let [package, version, _repo] = fields[..] else {
-                return None;
-            };
-            let (_, arch) = package.rsplit_once('.')?;
-            ["x86_64", "noarch", "i686", "aarch64"]
-                .contains(&arch)
-                .then_some((package, version))
-        })
-        .collect()
-}
-
-impl Source for Dnf {
-    fn id(&self) -> &'static str {
-        "dnf"
-    }
-
-    fn available(&self, ctx: &Context) -> bool {
-        ctx.have("dnf") && ctx.have("rpm")
-    }
-
-    fn inventory(&self, ctx: &mut Context, all: bool, _versions: bool) -> Query<Item> {
-        let query = if all {
-            Cmd::new(["rpm", "-qa", "--qf", "%{NAME} %{VERSION}-%{RELEASE}\\n"])
-        } else {
-            Cmd::new(["dnf", "--cacheonly", "--quiet", "repoquery", "--userinstalled"])
-                .args(["--qf", "%{name} %{evr}\\n"])
-        };
-        let Some(listing) = ctx.read(&query) else {
-            return Query::failure();
-        };
-        let unique: BTreeSet<(&str, &str)> = listing
-            .lines()
-            .filter_map(|line| line.split_once(' '))
-            .collect();
-        unique
-            .into_iter()
-            .map(|(name, version)| Item::new(name, version))
-            .collect::<Vec<_>>()
-            .into()
-    }
-
-    fn outdated(&self, ctx: &mut Context, pick: Pick) -> Query<Update> {
-        let check = if ctx.dry {
-            Cmd::new(["dnf", "check-upgrade", "--cacheonly"])
-        } else {
-            Cmd::new(["sudo", "dnf", "check-upgrade", "--refresh"]).interactive()
-        };
-        let result = ctx.capture(&check);
-        // 100 — "є оновлення".
-        if !matches!(result.code, Some(0 | 100)) {
-            return Query::failure();
-        }
-        let mut updates = Vec::new();
-        for (package, latest) in parse_check_upgrade(&result.stdout) {
-            let name = package.rsplit_once('.').map_or(package, |(name, _)| name);
-            if !pick.has(name) {
-                continue;
-            }
-            let installed = Cmd::new(["rpm", "-q", "--qf", "%{EVR}\\n", package]).quiet();
-            let current = ctx.read(&installed).unwrap_or_default();
-            let shown = package
-                .trim_end_matches(".x86_64")
-                .trim_end_matches(".noarch");
-            let current = current.lines().last().unwrap_or_default();
-            updates.push(Update::new(shown, current, latest).key(name));
-        }
-        updates.into()
-    }
-
-    fn upgrade(&self, ctx: &mut Context, pick: Pick) -> Status {
-        let mut cmd = Cmd::new(["sudo", "dnf", "upgrade", "--refresh"]);
-        if ctx.yes {
-            cmd = cmd.args(["-y"]);
-        }
-        Status::from_success(ctx.run(&cmd.args(pick.keys().to_vec())))
-    }
-
-    fn can_remove(&self) -> bool {
-        true
-    }
-
-    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
-        if pick.keys().is_empty() {
-            return Status::Skipped;
-        }
-        let mut cmd = Cmd::new(["sudo", "dnf", "remove"]);
-        if ctx.yes {
-            cmd = cmd.args(["-y"]);
-        }
-        run_removals(ctx, vec![cmd.args(pick.keys().to_vec())])
-    }
-
-    fn needs_sudo(&self) -> bool {
-        true
-    }
 }
 
 // ---------------------------------------------------------------- Flatpak
@@ -625,23 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn dnf_remove_uses_sudo_and_only_selected_packages() {
-        let keys = picked(&["vim", "htop"]);
-        let (mut ctx, lines) = dry(true);
-        assert!(Dnf.can_remove());
-        assert!(Dnf.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
-        assert_eq!(commands(&lines), vec!["sudo dnf remove -y vim htop"]);
-
-        let (mut ctx, lines) = dry(false);
-        assert!(Dnf.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
-        assert_eq!(commands(&lines), vec!["sudo dnf remove vim htop"]);
-
-        let (mut ctx, lines) = dry(true);
-        assert!(Dnf.remove(&mut ctx, Pick(None)) == Status::Skipped);
-        assert!(lines.lock().unwrap().is_empty());
-    }
-
-    #[test]
     fn flatpak_uninstall_never_mixes_installations() {
         let keys = picked(&[
             "user org.gnome.Software",
@@ -697,13 +553,6 @@ mod tests {
             .collect();
         assert_eq!(shown, vec!["app-manager uninstall /home/user/Apps/Foo.AppImage"]);
         assert!(AppImage.can_remove());
-    }
-
-    #[test]
-    fn check_upgrade_stops_at_obsoletes() {
-        let listing = "Upgrades\nfirefox.x86_64  141-1  updates\n\nObsoleting packages\n\
-                       newthing.x86_64 1 updates\n";
-        assert_eq!(parse_check_upgrade(listing), [("firefox.x86_64", "141-1")]);
     }
 
     #[test]

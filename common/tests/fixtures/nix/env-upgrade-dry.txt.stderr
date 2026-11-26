@@ -1,0 +1,21 @@
+(dry run; not doing anything)
+unpacking 'https://github.com/NixOS/nixpkgs/archive/refs/tags/24.05.tar.gz' into the Git cache...
+trace: warning: cudaPackages.autoAddDriverRunpath is deprecated, use pkgs.autoAddDriverRunpath instead
+trace: warning: cudaPackages.autoAddOpenGLRunpathHook is deprecated, use pkgs.autoAddDriverRunpath instead
+trace: warning: cudaPackages.autoFixElfFiles is deprecated, use pkgs.autoFixElfFiles instead
+trace: warning: cudaPackages.autoAddDriverRunpath is deprecated, use pkgs.autoAddDriverRunpath instead
+trace: warning: cudaPackages.autoAddOpenGLRunpathHook is deprecated, use pkgs.autoAddDriverRunpath instead
+trace: warning: cudaPackages.autoFixElfFiles is deprecated, use pkgs.autoFixElfFiles instead
+trace: warning: cudaPackages.autoAddDriverRunpath is deprecated, use pkgs.autoAddDriverRunpath instead
+trace: warning: cudaPackages.autoAddOpenGLRunpathHook is deprecated, use pkgs.autoAddDriverRunpath instead
+trace: warning: cudaPackages.autoFixElfFiles is deprecated, use pkgs.autoFixElfFiles instead
+trace: warning: eww now can build for X11 and wayland simultaneously, so `eww-wayland` is deprecated, use the normal `eww` package instead.
+trace: warning: lxd has been renamed to lxd-lts
+trace: warning: lxd-unwrapped has been renamed to lxd-unwrapped-lts
+trace: warning: nixfmt was renamed to nixfmt-classic. The nixfmt attribute may be used for the new RFC 166-style formatter in the future, which is currently available as nixfmt-rfc-style
+trace: warning: nvtop has been renamed to nvtopPackages.full
+trace: warning: nvtop-amd has been renamed to nvtopPackages.amd
+trace: warning: nvtop-intel has been renamed to nvtopPackages.intel
+trace: warning: nvtop-msm has been renamed to nvtopPackages.msm
+trace: warning: nvtop-nvidia has been renamed to nvtopPackages.nvidia
+trace: warning: writeReferencesToFile is deprecated in favour of writeClosure

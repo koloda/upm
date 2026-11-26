@@ -10,6 +10,12 @@ use crate::source::{Item, Source, Status, Update};
 
 type Sources = [Box<dyn Source>];
 
+/// Чи назвав користувач це джерело: тоді про його відсутність треба сказати.
+/// Решту відсутніх тут джерел операції мовчки пропускають.
+fn asked_for(scope: &Scope, picks: &Picks, id: &str) -> bool {
+    scope.named(id) || scope.only.iter().any(|only| *only == id) || picks.contains_key(id)
+}
+
 // ---------------------------------------------------------------- Пошук названих пакунків
 #[derive(Clone, Copy)]
 enum Match {
@@ -230,11 +236,15 @@ pub fn check_updates(
         if !scope.is_active(picks, id) || (id == "manual" && !picks.contains_key(id)) {
             continue;
         }
+        let available = source.available(ctx);
+        if !available && !asked_for(scope, picks, id) {
+            continue;
+        }
         on_event(ctx, CheckEvent::Started(id));
         let selection = pick(picks, id);
         let mut check = SourceCheck {
             source: id,
-            available: source.available(ctx),
+            available,
             updates: Vec::new(),
             failed: false,
             unchecked: Vec::new(),
@@ -308,9 +318,9 @@ pub fn upgrade(
     mut on_start: impl FnMut(&mut Context, &'static str),
 ) -> Summary {
     // Для окремих пакунків sudo сам запитає пароль, якщо він справді потрібен.
-    let needs_sudo = sources
-        .iter()
-        .any(|source| source.needs_sudo() && scope.is_active(picks, source.id()));
+    let needs_sudo = sources.iter().any(|source| {
+        source.needs_sudo() && scope.is_active(picks, source.id()) && source.available(ctx)
+    });
     if !ctx.dry && scope.targets.is_empty() && picks.is_empty() && needs_sudo {
         keep_sudo(ctx);
     }
@@ -324,8 +334,12 @@ pub fn upgrade(
         if !scope.is_active(picks, id) || (id == "manual" && !picks.contains_key(id)) {
             continue;
         }
+        let available = source.available(ctx);
+        if !available && !asked_for(scope, picks, id) {
+            continue;
+        }
         on_start(ctx, id);
-        let status = if source.available(ctx) {
+        let status = if available {
             source.upgrade(ctx, pick(picks, id))
         } else {
             Status::Skipped
@@ -361,6 +375,7 @@ pub fn remove(
             && picks
                 .get(source.id())
                 .is_some_and(|keys| !keys.is_empty())
+            && source.available(ctx)
     });
     if !ctx.dry && needs_sudo {
         keep_sudo(ctx);
@@ -405,7 +420,10 @@ pub struct ManualReport {
 
 pub fn manual_report(ctx: &mut Context, sources: &Sources) -> ManualReport {
     let mut orphan_rpms = Vec::new();
-    if ctx.have("dnf") {
+    let has_dnf = sources
+        .iter()
+        .any(|source| source.id() == "dnf" && source.available(ctx));
+    if has_dnf {
         let query = Cmd::new(["dnf", "--cacheonly", "--quiet", "list", "--extras"]).quiet();
         orphan_rpms = ctx
             .capture(&query)
@@ -437,6 +455,7 @@ mod tests {
     use super::*;
     use crate::report::Reporter;
     use crate::source::{Pick, Query};
+    use crate::testing::Host;
 
     #[derive(Clone, Default)]
     struct Recorder(Arc<Mutex<Vec<String>>>);
@@ -575,6 +594,106 @@ mod tests {
         }
         fn upgrade(&self, _: &mut Context, _: Pick) -> Status {
             Status::Ok
+        }
+    }
+
+    /// Джерело, яке є або нема, і хоче sudo.
+    struct Presence(&'static str, bool);
+
+    impl Source for Presence {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn available(&self, _: &Context) -> bool {
+            self.1
+        }
+        fn inventory(&self, _: &mut Context, _: bool, _: bool) -> Query<Item> {
+            Query::new()
+        }
+        fn outdated(&self, _: &mut Context, _: Pick) -> Query<Update> {
+            Query::new()
+        }
+        fn upgrade(&self, _: &mut Context, _: Pick) -> Status {
+            Status::Ok
+        }
+        fn needs_sudo(&self) -> bool {
+            true
+        }
+    }
+
+    fn present_and_absent() -> Vec<Box<dyn Source>> {
+        vec![
+            Box::new(Presence("apt", true)),
+            Box::new(Presence("dnf", false)),
+        ]
+    }
+
+    fn checked_sources(ctx: &mut Context, scope: &Scope) -> Vec<(&'static str, bool)> {
+        let mut seen = Vec::new();
+        check_updates(ctx, scope, &Picks::new(), &present_and_absent(), |_, event| {
+            match event {
+                CheckEvent::Started(id) => seen.push((id, false)),
+                CheckEvent::Finished(check) => {
+                    seen.last_mut().unwrap().1 = check.available;
+                }
+            }
+        });
+        seen
+    }
+
+    #[test]
+    fn absent_source_is_silent_unless_named() {
+        let (mut ctx, mut scope, _, _) = setup(&[]);
+        assert_eq!(checked_sources(&mut ctx, &scope), [("apt", true)]);
+        scope.sources = vec!["dnf"];
+        assert_eq!(checked_sources(&mut ctx, &scope), [("dnf", false)]);
+        scope = Scope {
+            only: vec!["dnf"],
+            ..Scope::default()
+        };
+        assert_eq!(checked_sources(&mut ctx, &scope), [("dnf", false)]);
+    }
+
+    #[test]
+    fn upgrade_summary_omits_absent_sources_unless_named() {
+        let (mut ctx, scope, _, _) = setup(&[]);
+        let mut started = Vec::new();
+        let summary = upgrade(&mut ctx, &scope, &Picks::new(), &present_and_absent(), |_, id| {
+            started.push(id)
+        });
+        assert_eq!(started, ["apt"]);
+        assert_eq!(summary.ok, ["apt"]);
+        assert!(summary.skipped.is_empty());
+
+        let named = Scope {
+            sources: vec!["dnf"],
+            ..Scope::default()
+        };
+        let summary = upgrade(&mut ctx, &named, &Picks::new(), &present_and_absent(), |_, _| {});
+        assert_eq!(summary.skipped, ["dnf"]);
+    }
+
+    #[test]
+    fn sudo_is_asked_only_for_present_sources() {
+        for (present, expected) in [(false, vec![]), (true, vec!["sudo -v"])] {
+            let mut host = Host::new("");
+            host.stub("sudo", "exit 0");
+            let sources: Vec<Box<dyn Source>> = vec![Box::new(Presence("apt", present))];
+            upgrade(&mut host.ctx, &Scope::default(), &Picks::new(), &sources, |_, _| {});
+            assert_eq!(host.calls(), expected, "present: {present}");
+        }
+    }
+
+    #[test]
+    fn orphan_rpms_are_reported_only_where_dnf_is_the_native_source() {
+        let listing = "echo 'stray.x86_64 1.0 @System'";
+        for (present, orphans) in [(true, 1), (false, 0)] {
+            let mut host = Host::new("");
+            host.stub("dnf", listing);
+            let sources: Vec<Box<dyn Source>> = vec![Box::new(Presence("dnf", present))];
+            let report = manual_report(&mut host.ctx, &sources);
+            assert_eq!(report.orphan_rpms.len(), orphans);
+            assert_eq!(host.calls().len(), orphans);
         }
     }
 

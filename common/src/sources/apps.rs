@@ -4,28 +4,8 @@ use std::path::PathBuf;
 
 use crate::context::{Cmd, Context, file_name, is_executable, list_dir};
 use crate::source::{Item, Pick, Query, Source, Status, Update};
+use crate::sources::run_removals;
 use crate::version::is_newer;
-
-/// Виконує дібрані команди видалення; після скасування нові не запускає.
-fn run_removals(ctx: &mut Context, commands: Vec<Cmd>) -> Status {
-    let total = commands.len();
-    let mut success = true;
-    let mut done = 0;
-    for cmd in &commands {
-        if ctx.interrupted() {
-            break;
-        }
-        done += 1;
-        success &= ctx.run(cmd);
-    }
-    if done == 0 {
-        Status::Skipped
-    } else if done < total {
-        Status::Failed
-    } else {
-        Status::from_success(success)
-    }
-}
 
 // ---------------------------------------------------------------- Програми з власним оновлювачем
 pub struct Tools;
@@ -35,7 +15,7 @@ struct Tool {
     path: PathBuf,
 }
 
-/// Наявні й не керовані через RPM.
+/// Наявні й не керовані пакунками дистрибутива.
 fn present_tools(ctx: &Context) -> Vec<Tool> {
     let local = [
         "claude", "cursor-agent", "droid", "kiro-cli", "omp", "agy", "unity", "qwen", "muse",
@@ -52,7 +32,7 @@ fn present_tools(ctx: &Context) -> Vec<Tool> {
         .into_iter()
         .chain(elsewhere)
         .chain(shared)
-        .filter(|(_, path)| is_executable(path) && !ctx.rpm_owned(path))
+        .filter(|(_, path)| is_executable(path) && !ctx.distro_owned(path))
         .map(|(name, path)| Tool { name, path })
         .collect()
 }
@@ -889,14 +869,14 @@ mod tests {
         let keys = picked(&["anything"]);
         let (mut ctx, lines) = dry();
         let mut seen = 0;
-        for source in crate::sources::all() {
-            if ["go", "tools", "firmware", "manual"].contains(&source.id()) {
+        for source in crate::sources::all(&Default::default()) {
+            if ["rpm", "go", "tools", "firmware", "manual"].contains(&source.id()) {
                 seen += 1;
                 assert!(!source.can_remove());
                 assert!(source.remove(&mut ctx, Pick(Some(&keys))) == Status::Skipped);
             }
         }
-        assert_eq!(seen, 4);
+        assert_eq!(seen, 5);
         assert!(lines.lock().unwrap().is_empty());
     }
 

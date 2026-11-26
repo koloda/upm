@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # Чорно-скринькові тести list/update/upgrade. Усі менеджери пакетів — заглушки,
 # HOME — підроблений, тож на справжній системі нічого не змінюється.
+# Комп'ютер симулюється через UPM_HOST_ROOT та власні заглушки менеджерів, тому
+# набір не залежить від дистрибутива, на якому запущений.
 # Використання: tests/blackbox.sh <шлях до update-all.sh або бінарника upm>
 SCRIPT=$(realpath "${1:?вкажіть програму для перевірки}")
 W=$(mktemp -d "${TMPDIR:-/tmp}/upm-test.XXXXXX")
-H=$W/home B=$W/stubs LOG=$W/calls.log
-mkdir -p "$H" "$B"
+# B — спільні заглушки; N/<комп'ютер> — менеджери конкретного дистрибутива.
+H=$W/home B=$W/stubs N=$W/native R=$W/roots SYS=$W/system LOG=$W/calls.log
+mkdir -p "$H" "$B" "$N" "$R" "$SYS"
+
+root() { # root <комп'ютер> <рядки os-release> [файли відносно кореня...]
+  mkdir -p "$R/$1/etc" "$N/$1"; printf '%b' "$2" >"$R/$1/etc/os-release"
+  local name=$1 file; shift 2
+  for file; do mkdir -p "$(dirname "$R/$name/$file")"; : >"$R/$name/$file"; done
+}
+root fedora 'ID=fedora\n'
 PASS=0 FAIL=0
 
 stub() { # stub <шлях> ; тіло зі stdin
@@ -16,16 +26,17 @@ stub() { # stub <шлях> ; тіло зі stdin
 
 stub "$B/sudo" <<'E'
 case $1 in -v|-n) exit 0 ;; esac
-[[ $1 == dnf ]] && { shift; exec "$(dirname "$0")/dnf" "$@"; }
+# Запити менеджерів ідуть через sudo — виконуємо їх заглушки.
+case $1 in dnf|yum) exec "$@" ;; esac
 exit 0
 E
-stub "$B/dnf" <<'E'
+stub "$N/fedora/dnf" <<'E'
 case "$*" in
   *repoquery*) printf 'bash 5.3-1\nfirefox 140-1\n' ;;
   *check-upgrade*) printf 'Upgrades\nfirefox.x86_64     141-1   updates\nlibdep.x86_64   2-1   updates\n\nObsoleting packages\nnewthing.x86_64 1 updates\n    oldthing.x86_64 1 @System\n'; exit 100 ;;
 esac
 E
-stub "$B/rpm" <<'E'
+stub "$N/fedora/rpm" <<'E'
 [[ $1 == -qf ]] && exec /usr/bin/rpm "$@"
 all=$'bash 5.3-1\nfirefox 140-1\nlibdep 1-1'
 [[ $1 == -qa ]] && { echo "$all"; exit; }
@@ -156,7 +167,10 @@ mkdir -p "$H/Apps/Scripts/tool-source/src" "$H/Apps/SomeIDE/bin"
 printf '#!/bin/sh\n' >"$H/Apps/Scripts/run-me.sh"; touch "$H/Apps/SomeIDE/product-info.json"
 
 # --- допоміжне
-run() { : >"$LOG"; OUT=$(env -i HOME="$H" PATH="$B:/usr/bin:/bin" LANG=C.UTF-8 timeout 120 "$SCRIPT" "$@" </dev/null 2>&1); RC=$?; CALLS=$(cat "$LOG"); }
+# Поточний симульований комп'ютер та його PATH.
+host() { HOST=$1; if [[ $1 == fedora ]]; then HOSTPATH=$N/fedora:$B:/usr/bin:/bin; else HOSTPATH=$N/$1:$B:$SYS; fi; }
+host fedora
+run() { : >"$LOG"; OUT=$(env -i HOME="$H" PATH="$HOSTPATH" UPM_HOST_ROOT="$R/$HOST" LANG=C.UTF-8 timeout 120 "$SCRIPT" "$@" </dev/null 2>&1); RC=$?; CALLS=$(cat "$LOG"); }
 ok() { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL [$T] $*"; }
 has() { grep -qE -- "$1" <<<"$OUT" && ok || bad "у виводі немає: $1"; }
@@ -171,7 +185,7 @@ MUTATING='^(sudo (dnf upgrade|npm install|.* (update|selfupdate|self-update))|dn
 T="без команди — довідка"; run; rc 0; has 'list'; has 'update'; has 'upgrade'; notcalled "$MUTATING"
 T="невідома команда"; run frobnicate; rcfail; notcalled "$MUTATING"
 
-T="list усе"; run list; rc 0
+T="list усе"; run list; rc 0; hasnt '==> (yum|zypper|rpm|apt|pacman|aur|apk|snap|nix) '
 for p in firefox com.microsoft.Edge glab Bruno fake-cli @scope/tool laravel/installer lazygit ripgrep mytool ruff droid claude java platform-tools jorgebucaran/fisher; do has "$p"; done
 hasnt 'libdep'; hasnt 'somedep'; hasnt 'libx'; hasnt 'org.gnome.Platform'; hasnt 'build-tools/99'; notcalled "$MUTATING"
 T="list: версії"; has 'firefox +140-1'; has 'fake-cli +1\.0\.0'; has 'lazygit +v1\.0\.0'; has 'droid +0\.1\.0'; has 'oldtool'
@@ -189,7 +203,7 @@ T="list джерело:пакунок"; run list dnf:bash; rc 0; has 'bash +5\.3
 T="list пакунок у вибраному джерелі"; run list dnf fire; rc 0; has firefox; hasnt fake-cli
 T="list нема такого"; run list zzznothing; rcfail
 
-T="update усе"; run update; rc 0
+T="update усе"; run update; rc 0; hasnt '==> (yum|zypper|rpm|apt|pacman|aur|apk|snap|nix)$'
 has 'firefox +140-1 +141-1'; has 'glab +1\.0 +1\.1'; has 'com\.microsoft\.Edge +158 +159'; has 'Bruno +3\.5\.0 +3\.6\.0'
 has 'fake-cli +1\.0\.0 +2\.0\.0'; has 'laravel/installer +v5\.32\.0 +v5\.33\.0'; has 'lazygit +v1\.0\.0 +v1\.1\.0'; has 'ripgrep +14\.0\.0 +15\.0\.0'
 has 'mytool +1\.0 +1\.2'; has 'ruff +0\.1\.0 +0\.2\.0'; has 'droid +0\.1\.0 +0\.2\.0'; has 'java +21-tem +25-tem'; has 'platform-tools +37\.0\.1 +37\.0\.3'
@@ -233,13 +247,170 @@ T="list manual: папка зі скриптами — не програма"; r
 T="сумісність: --only без команди"; run --only npm -n; rc 0; has fake-cli; hasnt '==> dnf'
 
 T="обірваний конвеєр"; : >"$LOG"
-OUT=$({ env -i HOME="$H" PATH="$B:/usr/bin:/bin" LANG=C.UTF-8 timeout 120 "$SCRIPT" list | head -n1; } 2>&1); hasnt 'panick|Broken pipe|обірван'
+OUT=$({ env -i HOME="$H" PATH="$HOSTPATH" UPM_HOST_ROOT="$R/$HOST" LANG=C.UTF-8 timeout 120 "$SCRIPT" list | head -n1; } 2>&1); hasnt 'panick|Broken pipe|обірван'
 
 T="Ctrl+C під час upgrade"; touch "$H/interrupt-brew"; run upgrade; rm "$H/interrupt-brew"
 rc 130; has 'Перервано'; has 'Підсумок'; notcalled '^go install'; notcalled '^npm install'
 
 T="Ctrl+C під час update зупиняє решту запитів"; touch "$H/interrupt-go"; run update go; rm "$H/interrupt-go"
 rc 130; [[ $(grep -c '^go list -m' <<<"$CALLS") == 1 ]] && ok || bad "після переривання запити тривають: $(grep -c '^go list -m' <<<"$CALLS")"
+
+# ------------------------------------------------------------ Інші дистрибутиви
+# Лише утиліти, без жодного менеджера пакунків цієї системи.
+for tool in bash sh env cat awk grep sed basename dirname head tail test timeout mktemp; do
+  ln -s "$(command -v "$tool")" "$SYS/$tool"
+done
+
+root debian 'ID=debian\n'
+stub "$N/debian/dpkg" <<'E'
+echo amd64
+E
+stub "$N/debian/dpkg-query" <<'E'
+[[ $1 == -S ]] && exit 1
+printf 'installed\thello\t2.10-3\tamd64\ninstalled\tlibdeb\t1.0\tamd64\ninstalled\tlibdeb\t1.0\ti386\n'
+E
+stub "$N/debian/apt-mark" <<'E'
+echo hello
+E
+stub "$N/debian/apt-get" <<'E'
+[[ $1 == -s ]] && printf 'Inst hello [2.10-3] (2.10-4 Debian:12 [amd64])\nConf hello (2.10-4 Debian:12 [amd64])\n'
+exit 0
+E
+
+root arch 'ID=arch\n'
+stub "$N/arch/pacman" <<'E'
+case $1 in
+  -Qen) echo 'tree 2.2.1-1' ;;
+  -Qn) printf 'tree 2.2.1-1\nzlib 1.3-1\n' ;;
+  -Qem|-Qm) echo 'downgrade 1.0-1' ;;
+  -Qo) exit 1 ;;
+  -Qun) echo 'tree 2.2.1-1 -> 2.3.2-1' ;;
+esac
+E
+stub "$N/arch/checkupdates" <<'E'
+echo 'tree 2.2.1-1 -> 2.3.2-1'
+E
+stub "$N/arch/paru" <<'E'
+[[ $1 == -Qua ]] && echo 'downgrade 1.0-1 -> 2.0-1'
+exit 0
+E
+
+for suse in leap:opensuse-leap tumbleweed:opensuse-tumbleweed; do
+  name=${suse%:*}
+  root "$name" "ID=${suse#*:}\nID_LIKE=\"opensuse suse\"\n"
+  stub "$N/$name/rpm" <<'E'
+[[ $1 == -qf ]] && exit 1
+printf 'less 643-1\nlibsuse 1-1\n'
+E
+  stub "$N/$name/zypper" <<'E'
+case "$*" in
+  *userinstalled*) echo 'i+ | Main | less | 643-1 | x86_64' ;;
+  *list-updates*) echo 'v  | Main | less | 643-1 | 643-2 | x86_64' ;;
+esac
+E
+done
+
+root alpine 'ID=alpine\n'; mkdir -p "$R/alpine/etc/apk"; echo tree >"$R/alpine/etc/apk/world"
+stub "$N/alpine/apk" <<'E'
+case "$*" in
+  "info -v") printf 'tree-2.1.1-r0\nmusl-1.2.5-r0\n' ;;
+  version*) printf 'Installed: Available:\ntree-2.1.1-r0 < 2.1.1-r1\n' ;;
+  "info --who-owns"*) exit 1 ;;
+esac
+E
+
+root centos 'ID="centos"\nID_LIKE="rhel fedora"\n'
+stub "$N/centos/rpm" <<'E'
+case $1 in
+  -qf) exit 1 ;;
+  -qa) printf 'bash 4.2-34\nlibyum 1-1\n' ;;
+  -q) echo 4.2-34 ;;
+esac
+E
+stub "$N/centos/repoquery" <<'E'
+printf 'bash user\nlibyum dep\n'
+E
+stub "$N/centos/yum" <<'E'
+[[ $1 == check-update ]] && { echo 'bash.x86_64   4.2-35   updates'; exit 100; }
+exit 0
+E
+
+root nixos 'ID=nixos\n'
+stub "$N/nixos/nix-env" <<'E'
+case "$*" in
+  "-q --json") echo '{"0":{"name":"ripgrep-14.0","pname":"ripgrep-nix","version":"14.0"}}' ;;
+  *--dry-run) echo "upgrading 'ripgrep-nix-14.0' to 'ripgrep-nix-15.0'" >&2 ;;
+esac
+E
+
+root atomic 'ID=fedora\n' run/ostree-booted
+stub "$N/atomic/rpm" <<'E'
+[[ $1 == -qf ]] && exit 1
+echo 'ostree-pkg 1-1'
+E
+stub "$N/atomic/dnf" <<'E'
+exit 0
+E
+
+# Зміни встановленого рідними менеджерами (оновлення списків репозиторіїв — не зміна).
+NATIVE_CHANGE='^(sudo (dnf (upgrade|remove)|yum (update|remove)|(env [^ ]+ )?apt-get .*(upgrade|install|remove) |apt-get (upgrade|install|remove)|zypper (--non-interactive )?(update|dup|remove)|pacman -(S|R)|apk (--interactive )?(upgrade|del)|snap (refresh|remove))|(paru|yay) -S|nix-env --(upgrade$|uninstall))'
+# only <шаблон> — з менеджерів дистрибутивів викликано тільки дозволені.
+only() {
+  local others
+  others=$(grep -E '^(sudo )?(dnf|yum|zypper|apt-get|apt-mark|dpkg|dpkg-query|pacman|checkupdates|paru|apk|repoquery|nix-env) ' <<<"$CALLS" | grep -vE "^(sudo )?($1) ")
+  [[ -z $others ]] && ok || bad "чужі менеджери: $(head -3 <<<"$others")"
+}
+
+host debian
+T="debian: list"; run list; rc 0; has '==> apt'; has 'hello +2\.10-3'; hasnt 'libdeb'; hasnt '==> (dnf|yum|zypper|pacman|aur|apk|rpm)'; only 'apt-mark|dpkg|dpkg-query'; notcalled "$NATIVE_CHANGE"
+T="debian: list --all, дві архітектури"; run list apt --all; has 'libdeb:i386'
+T="debian: update"; run update; rc 0; has '==> apt'; has 'hello +2\.10-3 +2\.10-4'; hasnt '==> (dnf|pacman|zypper|apk)'; called '^sudo apt-get update'; called '^apt-get -s upgrade --with-new-pkgs'; only 'apt-get|apt-mark|dpkg|dpkg-query'; notcalled "$NATIVE_CHANGE"
+T="debian: update -n без sudo"; run update -n apt; rc 0; notcalled '^sudo'
+T="debian: названого чужого джерела тут немає"; run update dnf; rc 0; has 'тут цього джерела немає'; notcalled '^(sudo )?dnf'
+T="debian: upgrade пакунка"; run upgrade apt:hello; rc 0; called '^sudo apt-get install --only-upgrade --no-remove hello$'
+T="debian: upgrade -y без термінала не питає"; run upgrade -y deb; rc 0; called '^sudo env DEBIAN_FRONTEND=noninteractive apt-get .*--force-confold upgrade --with-new-pkgs -y$'
+
+host arch
+T="arch: list"; run list; rc 0; has '==> pacman'; has '==> aur'; has 'downgrade'; hasnt 'zlib'; hasnt '==> (dnf|apt|zypper|apk|rpm)'; only 'pacman'; notcalled "$NATIVE_CHANGE"
+T="arch: update"; run update; rc 0; has 'tree +2\.2\.1-1 +2\.3\.2-1'; has 'downgrade +1\.0-1 +2\.0-1'; called '^checkupdates'; called '^paru -Qua'; only 'pacman|checkupdates|paru'; notcalled '^(sudo )?pacman -Sy'; notcalled "$NATIVE_CHANGE"
+T="arch: окремий пакунок pacman не оновлюється"; run upgrade -y pacman:tree; rc 0; has 'цілком'; has 'Пропущено: pacman'; notcalled "$NATIVE_CHANGE"
+T="arch: усе джерело pacman"; run upgrade -y pacman; rc 0; called '^sudo pacman -Syu --noconfirm$'
+T="arch: без -y і термінала нічого"; run upgrade pacman; rc 0; has 'Пропущено: pacman'; notcalled "$NATIVE_CHANGE"
+T="arch: AUR без термінала не збирається"; run upgrade -y aur; rc 0; has 'термінал'; has 'Пропущено: aur'; notcalled '^(paru|yay) -S'
+
+host leap
+T="leap: list"; run list; rc 0; has '==> zypper'; has 'less +643-1'; hasnt 'libsuse'; hasnt '==> (dnf|rpm|apt|pacman|apk)'; notcalled "$NATIVE_CHANGE"
+T="leap: update"; run update; rc 0; has 'less +643-1 +643-2'; called '^sudo zypper refresh'; only 'zypper'; notcalled "$NATIVE_CHANGE"
+T="leap: upgrade"; run upgrade -y zypper; rc 0; called '^sudo zypper --non-interactive update$'
+T="leap: rpm означає zypper"; run upgrade -y rpm:less; rc 0; called '^sudo zypper --non-interactive update less$'
+
+host tumbleweed
+T="tumbleweed: повне оновлення — dup"; run upgrade -y zypper; rc 0; called '^sudo zypper --non-interactive dup$'
+
+host alpine
+T="alpine: list"; run list; rc 0; has '==> apk'; has 'tree +2\.1\.1-r0'; hasnt 'musl'; hasnt '==> (dnf|apt|pacman|zypper|rpm)'; notcalled "$NATIVE_CHANGE"
+T="alpine: update"; run update; rc 0; has 'tree +2\.1\.1-r0 +2\.1\.1-r1'; called '^sudo apk update'; only 'apk'; notcalled "$NATIVE_CHANGE"
+T="alpine: upgrade пакунка"; run upgrade -y apk:tree; rc 0; called '^sudo apk upgrade tree$'
+
+host centos
+T="yum: list"; run list; rc 0; has '==> yum'; has 'bash +4\.2-34'; hasnt 'libyum'; hasnt '==> (dnf|rpm|apt) '; notcalled "$NATIVE_CHANGE"
+T="yum: rpm означає yum"; run list rpm; rc 0; has '==> yum'
+T="yum: update"; run update; rc 0; has 'bash +4\.2-34 +4\.2-35'; called '^sudo yum check-update -q'; only 'yum|repoquery'; notcalled "$NATIVE_CHANGE"
+T="yum: upgrade"; run upgrade -y yum; rc 0; called '^sudo yum update -y$'
+
+host nixos
+T="nixos: list"; run list; rc 0; hasnt '==> (nix) '; hasnt '==> (dnf|apt|pacman|zypper|apk|rpm)'
+mkdir -p "$H/.nix-profile"; : >"$H/.nix-profile/manifest.nix"
+T="nixos: профіль користувача"; run list; rc 0; has '==> nix'; has 'ripgrep-nix +14\.0'; only 'nix-env'
+T="nixos: update"; run update nix; rc 0; has 'ripgrep-nix +14\.0 +15\.0'; notcalled "$NATIVE_CHANGE"
+T="nixos: upgrade без sudo"; run upgrade nix; rc 0; called '^nix-env --upgrade$'; notcalled '^sudo'
+rm -rf "$H/.nix-profile"
+
+host atomic
+T="atomic: лише перегляд rpm"; run list; rc 0; has '==> rpm'; has 'ostree-pkg'; hasnt '==> dnf'; notcalled '^(sudo )?dnf'
+T="atomic: неперевірене не видається за актуальне"; run update rpm; rc 0; has 'перевірити нема чим: 1'; hasnt 'оновлень не знайдено'
+T="atomic: upgrade нічого не міняє"; run upgrade -y rpm; rc 0; has 'лише показує'; has 'Пропущено: rpm'; notcalled "$NATIVE_CHANGE"; notcalled '^(sudo )?dnf'
+host fedora
 
 echo "PASS=$PASS FAIL=$FAIL (робоча тека: $W)"
 ((FAIL == 0))

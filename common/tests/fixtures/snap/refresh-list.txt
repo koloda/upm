@@ -1,0 +1,4 @@
+Name           Version                    Rev   Publisher     Notes
+core           16-2.45.1+git2022.b6b3c25  9584  canonical✓    core
+get-iplayer    3.26                       250   snapcrafters  -
+qt551          5.5                        30    keshavnrj     -

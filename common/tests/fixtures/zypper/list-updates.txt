@@ -1,0 +1,13 @@
+Loading repository data...
+Warning: Repository 'Update repository of openSUSE Backports' metadata expired since 2026-07-10 11:19:15 UTC.
+Warning: Repository 'Main Update Repository' metadata expired since 2026-10-13 22:33:04 UTC.
+
+    Warning: Repository metadata expired: Check if 'autorefresh' is turned on (zypper lr), otherwise
+    manually refresh the repository (zypper ref). If this does not solve the issue, it could be that
+    you are using a broken mirror or the server has actually discontinued to support the repository.
+
+Reading installed packages...
+S  | Repository                                                   | Name | Current Version    | Available Version  | Arch
+---+--------------------------------------------------------------+------+--------------------+--------------------+-------
+v  | Update repository with updates from SUSE Linux Enterprise 15 | less | 643-150600.1.37    | 643-150600.3.3.1   | x86_64
+v  | Update repository with updates from SUSE Linux Enterprise 15 | tar  | 1.34-150000.3.34.1 | 1.34-150000.3.37.1 | x86_64

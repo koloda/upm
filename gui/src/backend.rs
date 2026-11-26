@@ -204,7 +204,7 @@ impl Backend {
                 // Підтвердження вже було у вікні, тому "yes".
                 let mut ctx = Context::new(home, dry, true, journal);
                 ctx.askpass = find_askpass();
-                let sources = sources::all();
+                let sources = sources::all(&ctx.platform);
                 jobs::run(job, &mut ctx, &sources, &catalog, &|| {
                     let _ = screen.queue(|backend| backend.publish());
                 })

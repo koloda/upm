@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::engine::SourceCheck;
+use crate::platform::Platform;
 use crate::scope::{Picks, Scope};
 use crate::source::{Item, Update};
 use crate::sources;
@@ -89,8 +90,8 @@ struct Entry {
 }
 
 impl Entry {
-    fn rows(&self) -> Vec<Row> {
-        let removable = sources::removable(self.id);
+    fn rows(&self, platform: &Platform) -> Vec<Row> {
+        let removable = sources::removable(self.id, platform);
         let updates: &[Update] = self.check.as_ref().map_or(&[], |check| &check.updates);
         let mut used = vec![false; updates.len()];
         let mut rows: Vec<Row> = self
@@ -163,6 +164,8 @@ impl Entry {
 pub struct Catalog {
     /// Ключ — позиція джерела в загальному порядку.
     entries: BTreeMap<usize, Entry>,
+    /// Від комп'ютера залежить, які пакунки можна видалити.
+    platform: Platform,
 }
 
 impl Catalog {
@@ -190,12 +193,16 @@ impl Catalog {
         entry.check = Some(check);
     }
 
+    pub fn set_platform(&mut self, platform: &Platform) {
+        self.platform = platform.clone();
+    }
+
     pub fn rows(&self, filter: &Filter) -> Vec<Row> {
         let search = filter.search.trim().to_lowercase();
         self.entries
             .values()
             .filter(|entry| filter.source.is_none_or(|source| source == entry.id))
-            .flat_map(Entry::rows)
+            .flat_map(|entry| entry.rows(&self.platform))
             .filter(|row| !filter.only_upgradable || row.state == State::Upgradable)
             .filter(|row| row.name.to_lowercase().contains(&search))
             .collect()
@@ -552,6 +559,29 @@ mod tests {
         assert!(!removable("tools", "claude"));
         assert!(!removable("firmware", "SSD"));
         assert!(!removable("manual", "zed"));
+    }
+
+    #[test]
+    fn read_only_sources_are_never_removable() {
+        use crate::platform::{Family, Platform};
+        let mut platform = Platform::default();
+        platform.family = Some(Family::Arch);
+        let mut catalog = Catalog::default();
+        catalog.set_items("pacman", vec![Item::new("tree", "1")]);
+        catalog.set_items("rpm", vec![Item::new("bash", "5")]);
+        catalog.set_platform(&platform);
+        let removable = |catalog: &Catalog| -> Vec<bool> {
+            rows(catalog, None, false, "")
+                .iter()
+                .map(|row| row.removable)
+                .collect()
+        };
+        assert_eq!(removable(&catalog), [false, true]);
+        // SteamOS: системні пакунки лише для читання.
+        platform.immutable = true;
+        catalog.set_platform(&platform);
+        assert_eq!(removable(&catalog), [false, false]);
+        assert!(catalog.deletion_plan(&selected(&[("pacman", "tree")])).is_empty());
     }
 
     #[test]

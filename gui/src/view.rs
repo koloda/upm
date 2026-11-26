@@ -7,7 +7,16 @@ pub fn title(id: &str) -> &str {
     match id {
         "" => "All",
         "dnf" => "DNF",
+        "yum" => "YUM",
+        "zypper" => "Zypper",
+        "rpm" => "RPM",
+        "apt" => "APT",
+        "pacman" => "Pacman",
+        "aur" => "AUR",
+        "apk" => "APK",
         "flatpak" => "Flatpak",
+        "snap" => "Snap",
+        "nix" => "Nix",
         "brew" => "Homebrew",
         "appimage" => "AppImage",
         "npm" => "Node",
@@ -143,6 +152,26 @@ mod tests {
 
     fn parse(json: String) -> Value {
         serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn every_source_has_a_readable_title() {
+        for (id, expected) in [
+            ("yum", "YUM"),
+            ("zypper", "Zypper"),
+            ("rpm", "RPM"),
+            ("apt", "APT"),
+            ("pacman", "Pacman"),
+            ("aur", "AUR"),
+            ("apk", "APK"),
+            ("snap", "Snap"),
+            ("nix", "Nix"),
+        ] {
+            assert_eq!(title(id), expected);
+        }
+        for id in upm_common::sources::NAMES {
+            assert_ne!(title(id), id, "без назви: {id}");
+        }
     }
 
     #[test]

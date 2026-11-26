@@ -1,0 +1,9 @@
+Name               Version          Rev    Tracking       Publisher     Notes
+alacritty          0.8.0            46     latest/stable  snapcrafters  classic
+bare               1.0              5      latest/stable  canonical✓    base
+core22             20240111         1122   latest/stable  canonical✓    base
+gnome-42-2204      0+git.510a601    176    latest/stable  canonical✓    -
+gtk-common-themes  0.1-81-g442e511  1535   latest/stable  canonical✓    -
+snapd              2.61.3           21184  latest/stable  canonical✓    snapd
+vlc                3.0.18           3078   latest/stable  videolan✓     -
+yt-dlp             18               212    latest/edge    morrisong     held

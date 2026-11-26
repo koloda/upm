@@ -1,0 +1,1 @@
+/usr/bin/pacman is owned by pacman 7.1.0.r9.g54d9411-4

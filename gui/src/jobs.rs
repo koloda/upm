@@ -46,6 +46,7 @@ pub fn run(
     catalog: &Mutex<Catalog>,
     changed: &dyn Fn(),
 ) -> Outcome {
+    lock(catalog).set_platform(&ctx.platform);
     match job {
         Job::Load => {
             load(ctx, sources::NAMES.to_vec(), sources, catalog, changed);
@@ -171,11 +172,26 @@ fn report(ctx: &mut Context, summary: &Summary, action: &str) -> String {
     for note in &ctx.notes {
         ctx.log(&format!("• {note}\n"));
     }
-    if summary.failed.is_empty() {
-        format!("{action} завершено")
-    } else {
-        let failed: Vec<&str> = summary.failed.iter().map(|id| view::title(id)).collect();
-        format!("{action} з помилками: {}. Деталі в журналі", failed.join(", "))
+    let titles = |ids: &[&str]| {
+        let titles: Vec<&str> = ids.iter().map(|id| view::title(id)).collect();
+        titles.join(", ")
+    };
+    match (summary.failed.is_empty(), summary.skipped.is_empty()) {
+        (true, true) => format!("{action} завершено"),
+        // Пропущене не можна видавати за зроблене.
+        (true, false) => format!(
+            "{action}: пропущено {}. Деталі в журналі",
+            titles(&summary.skipped)
+        ),
+        (false, true) => format!(
+            "{action} з помилками: {}. Деталі в журналі",
+            titles(&summary.failed)
+        ),
+        (false, false) => format!(
+            "{action} з помилками: {}; пропущено {}. Деталі в журналі",
+            titles(&summary.failed),
+            titles(&summary.skipped)
+        ),
     }
 }
 
@@ -185,6 +201,7 @@ mod tests {
 
     use upm_common::catalog::Filter;
     use upm_common::context::{Cmd, Context};
+    use upm_common::platform::Family;
     use upm_common::report::Reporter;
     use upm_common::source::{Item, Pick, Query, Source, Status, Update};
 
@@ -374,5 +391,94 @@ mod tests {
         });
         assert!(fixture.deleted.lock().unwrap().is_empty());
         assert_eq!(outcome.status, "Нічого видаляти");
+    }
+
+    #[test]
+    fn the_catalog_learns_what_this_host_allows_to_delete() {
+        let mut fixture = Fixture::new();
+        fixture.sources = vec![Box::new(Fake(
+            "pacman",
+            fixture.upgraded.clone(),
+            fixture.deleted.clone(),
+        ))];
+        fixture.ctx.platform.family = Some(Family::Arch);
+        fixture.ctx.platform.immutable = true;
+        fixture.run(Job::Load);
+        let rows = fixture.catalog.lock().unwrap().rows(&Filter {
+            source: None,
+            only_upgradable: false,
+            search: "",
+        });
+        assert!(!rows.is_empty() && rows.iter().all(|row| !row.removable));
+    }
+
+    /// Джерело, яке відмовляється щось міняти й пояснює чому.
+    struct Declines(&'static str, Status);
+
+    impl Source for Declines {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn available(&self, _: &Context) -> bool {
+            true
+        }
+        fn inventory(&self, _: &mut Context, _: bool, _: bool) -> Query<Item> {
+            vec![Item::new("one", "1")].into()
+        }
+        fn outdated(&self, _: &mut Context, _: Pick) -> Query<Update> {
+            Query::new()
+        }
+        fn upgrade(&self, ctx: &mut Context, _: Pick) -> Status {
+            ctx.note("оновіть джерело цілком".to_string());
+            self.1
+        }
+    }
+
+    fn upgraded_with(sources: Vec<Box<dyn Source>>) -> (Outcome, String) {
+        let log = Log::default();
+        let text = log.0.clone();
+        let mut fixture = Fixture::new();
+        fixture.ctx = Context::new("/nonexistent".into(), true, true, Box::new(log));
+        fixture.sources = sources;
+        fixture.run(Job::Load);
+        let ids: Vec<_> = fixture.sources.iter().map(|source| source.id()).collect();
+        let selected = ids
+            .iter()
+            .map(|id| (id.to_string(), "one".to_string()))
+            .collect();
+        let outcome = fixture.run(Job::Upgrade {
+            source: None,
+            selected,
+        });
+        let text = text.lock().unwrap().clone();
+        (outcome, text)
+    }
+
+    #[test]
+    fn skipped_upgrade_is_named_in_the_status_and_explained_in_the_log() {
+        let (outcome, log) = upgraded_with(vec![Box::new(Declines("pacman", Status::Skipped))]);
+        assert_eq!(
+            outcome.status,
+            "Оновлення: пропущено Pacman. Деталі в журналі"
+        );
+        assert!(log.contains("оновіть джерело цілком"), "{log}");
+    }
+
+    #[test]
+    fn failures_and_skips_are_both_reported() {
+        let (outcome, _) = upgraded_with(vec![
+            Box::new(Declines("apt", Status::Failed)),
+            Box::new(Declines("aur", Status::Skipped)),
+        ]);
+        assert_eq!(
+            outcome.status,
+            "Оновлення з помилками: APT; пропущено AUR. Деталі в журналі"
+        );
+    }
+
+    #[test]
+    fn successful_upgrade_reports_completion() {
+        let (outcome, _) = upgraded_with(vec![Box::new(Declines("snap", Status::Ok))]);
+        assert_eq!(outcome.status, "Оновлення завершено");
     }
 }

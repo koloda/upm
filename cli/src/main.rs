@@ -14,7 +14,7 @@ use output::Terminal;
 
 /// Виконує команду й повертає код завершення.
 fn run(program: &str, args: &[String]) -> i32 {
-    let request = match args::parse(args) {
+    let mut request = match args::parse(args) {
         Ok(request) => request,
         Err(message) => {
             eprintln!("{message}");
@@ -42,7 +42,9 @@ fn run(program: &str, args: &[String]) -> i32 {
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         let _ = signal_hook::flag::register(signal, ctx.cancel_flag());
     }
-    let sources = sources::all();
+    let sources = sources::all(&ctx.platform);
+    // "rpm" означає різне на різних комп'ютерах.
+    sources::map_to_host(&ctx, &mut request.scope);
     let scope = &request.scope;
 
     if request.action == Action::List {
