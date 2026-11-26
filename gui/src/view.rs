@@ -1,7 +1,7 @@
 //! Перетворення даних ядра на те, що показує QML (JSON), і назад.
 
 use serde_json::json;
-use upm_common::catalog::{Catalog, Filter, Plan, State};
+use upm_common::catalog::{Catalog, DeletionPlan, Filter, Plan, State};
 
 pub fn title(id: &str) -> &str {
     match id {
@@ -64,6 +64,7 @@ pub fn rows(catalog: &Catalog, filter: &Filter) -> String {
             "latest": row.latest,
             "state": state,
             "info": row.info,
+            "removable": row.removable,
         })
     });
     serde_json::Value::Array(rows.collect()).to_string()
@@ -97,6 +98,26 @@ pub fn confirmation(plan: &Plan) -> String {
             line
         }));
     }
+    json!({ "runnable": !plan.is_empty(), "title": title, "lines": lines }).to_string()
+}
+
+/// Вікно підтвердження перед видаленням. На відміну від оновлення, тут
+/// немає режиму «все» — лише названі пакунки.
+pub fn delete_confirmation(plan: &DeletionPlan) -> String {
+    let (title, lines) = if plan.is_empty() {
+        (
+            "Нічого видаляти".to_string(),
+            vec!["Нічого видаляти: це оновлюється вручну або вже зникло.".to_string()],
+        )
+    } else {
+        (
+            "Видалити вибрані пакунки?".to_string(),
+            plan.preview
+                .iter()
+                .map(|row| format!("{}: {} {}", self::title(row.source), row.name, row.current))
+                .collect(),
+        )
+    };
     json!({ "runnable": !plan.is_empty(), "title": title, "lines": lines }).to_string()
 }
 
@@ -139,9 +160,20 @@ mod tests {
             only_upgradable: false,
             search: "",
         };
-        let rows = parse(rows(&catalog(), &filter));
-        assert_eq!(rows[0]["sourceTitle"], "Node");
-        assert_eq!(rows[0]["state"], "unchecked");
+        let parsed = parse(rows(&catalog(), &filter));
+        assert_eq!(parsed[0]["sourceTitle"], "Node");
+        assert_eq!(parsed[0]["state"], "unchecked");
+        assert_eq!(parsed[0]["removable"], true);
+
+        let manual = parse(rows(
+            &catalog(),
+            &Filter {
+                source: Some("manual"),
+                only_upgradable: false,
+                search: "",
+            },
+        ));
+        assert_eq!(manual[0]["removable"], false);
     }
 
     #[test]
@@ -161,6 +193,23 @@ mod tests {
 
         let manual = parse(confirmation(&catalog.upgrade_plan(Some("manual"), &[])));
         assert_eq!(manual["runnable"], false);
+    }
+
+    #[test]
+    fn deletion_confirmation_names_items_and_refuses_empty() {
+        let catalog = catalog();
+        let picked = [("npm".to_string(), "codex".to_string())];
+        let chosen = parse(delete_confirmation(&catalog.deletion_plan(&picked)));
+        assert_eq!(chosen["title"], "Видалити вибрані пакунки?");
+        assert_eq!(chosen["lines"][0], "Node: codex 1.0");
+        assert_eq!(chosen["runnable"], true);
+
+        let manual = [("manual".to_string(), "zed".to_string())];
+        let refused = parse(delete_confirmation(&catalog.deletion_plan(&manual)));
+        assert_eq!(refused["runnable"], false);
+
+        let empty = parse(delete_confirmation(&catalog.deletion_plan(&[])));
+        assert_eq!(empty["runnable"], false);
     }
 
     #[test]

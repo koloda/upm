@@ -29,6 +29,7 @@ Item {
 
         property var calls: []
         property bool runnable: true
+        property bool deleteRunnable: true
 
         function record(call) { calls = calls.concat([call]) }
         function selectSource(id) { record("source:" + id); currentSource = id }
@@ -43,13 +44,37 @@ Item {
             return JSON.stringify({ runnable: runnable, title: "Оновити?", lines: ["codex 1 → 2"] })
         }
         function upgrade(selected) { record("upgrade:" + selected) }
+        function planDelete(selected) {
+            record("planDelete:" + selected)
+            return JSON.stringify({
+                runnable: deleteRunnable,
+                title: deleteRunnable ? "Видалити вибрані пакунки?" : "Нічого видаляти...",
+                lines: deleteRunnable ? ["- sudo dnf remove codex"] : []
+            })
+        }
+        function deleteSelected(selected) {
+            record("deleteSelected:" + selected)
+            busy = true
+            upgrading = true
+            log = "- sudo dnf remove codex\n"
+            // Імітуємо завершення фонової роботи й оновлення таблиці.
+            Qt.callLater(function () {
+                rowsJson = JSON.stringify([
+                    { source: "npm", sourceTitle: "Node", key: "cline", name: "cline", current: "3", latest: "", state: "current", info: "", removable: true },
+                    { source: "go", sourceTitle: "Go", key: "air", name: "air", current: "v1", latest: "", state: "unchecked", info: "", removable: false },
+                    { source: "manual", sourceTitle: "Вручну", key: "zed", name: "zed", current: "-", latest: "", state: "unknown", info: "", removable: false }
+                ])
+                busy = false
+                upgrading = false
+            })
+        }
 
         function reset() {
             rowsJson = JSON.stringify([
-                { source: "npm", sourceTitle: "Node", key: "codex", name: "codex", current: "1", latest: "2", state: "upgradable", info: "" },
-                { source: "npm", sourceTitle: "Node", key: "cline", name: "cline", current: "3", latest: "", state: "current", info: "" },
-                { source: "go", sourceTitle: "Go", key: "air", name: "air", current: "v1", latest: "", state: "unchecked", info: "" },
-                { source: "manual", sourceTitle: "Вручну", key: "zed", name: "zed", current: "-", latest: "", state: "unknown", info: "" }
+                { source: "npm", sourceTitle: "Node", key: "codex", name: "codex", current: "1", latest: "2", state: "upgradable", info: "", removable: true },
+                { source: "npm", sourceTitle: "Node", key: "cline", name: "cline", current: "3", latest: "", state: "current", info: "", removable: true },
+                { source: "go", sourceTitle: "Go", key: "air", name: "air", current: "v1", latest: "", state: "unchecked", info: "", removable: false },
+                { source: "manual", sourceTitle: "Вручну", key: "zed", name: "zed", current: "-", latest: "", state: "unknown", info: "", removable: false }
             ])
             currentSource = ""
             onlyUpgradable = false
@@ -57,6 +82,7 @@ Item {
             busy = false
             upgrading = false
             runnable = true
+            deleteRunnable = true
             calls = []
         }
     }
@@ -215,6 +241,119 @@ Item {
             fake.log = "+ sudo dnf upgrade\n"
             fake.upgrading = true
             verify(panel.visible)
+        }
+
+        function del() { mouseClick(child("deleteSelectedButton")) }
+
+        function test_no_delete_button_on_rows() {
+            verify(!findChild(rowItem(0), "rowDelete"))
+            verify(!findChild(rowItem(2), "rowDelete"))
+            verify(!findChild(rowItem(3), "rowDelete"))
+        }
+
+        function test_selected_row_has_accent_background() {
+            const item = rowItem(0)
+            verify(!item.highlighted, "рядок не виділений початково")
+            check(0)
+            verify(item.highlighted, "вибраний рядок має бути підсвічений")
+            check(0)
+            verify(!item.highlighted, "зняття виділення повертає звичайний вигляд")
+        }
+
+        function test_bottom_delete_button_follows_removable_selection() {
+            const button = child("deleteSelectedButton")
+            verify(button)
+            compare(button.text, "Видалити вибрані")
+            verify(!button.enabled)
+            check(2)
+            compare(button.text, "Видалити вибрані", "go не видаляється")
+            verify(!button.enabled)
+            check(0)
+            compare(button.text, "Видалити вибрані (1)")
+            verify(button.enabled)
+        }
+
+        function test_bottom_delete_button_uses_delete_flow() {
+            check(0)
+            mouseClick(child("deleteSelectedButton"))
+            const dialog = child("confirmDialog")
+            tryVerify(() => dialog.opened)
+            compare(fake.calls, ['planDelete:[["npm","codex"]]'])
+            dialog.accept()
+            compare(fake.calls, [
+                'planDelete:[["npm","codex"]]',
+                'deleteSelected:[["npm","codex"]]'
+            ])
+        }
+
+        function test_busy_disables_bottom_delete() {
+            check(0)
+            fake.busy = true
+            verify(!child("deleteSelectedButton").enabled)
+        }
+
+        function test_delete_needs_confirmation() {
+            check(0)
+            check(1)
+            del(0)
+            const dialog = child("confirmDialog")
+            tryVerify(() => dialog.opened)
+            compare(fake.calls, ['planDelete:[["npm","codex"],["npm","cline"]]'])
+            compare(dialog.title, "Видалити вибрані пакунки?")
+            compare(child("confirmOk").text, "Видалити")
+            const lines = dialog.contentItem
+            lines.forceLayout()
+            compare(lines.count, 1)
+            compare(lines.itemAtIndex(0).text, "- sudo dnf remove codex")
+        }
+
+        function test_delete_confirm_calls_delete_and_clears_selection() {
+            check(0)
+            del(0)
+            const dialog = child("confirmDialog")
+            tryVerify(() => dialog.opened)
+            dialog.accept()
+            compare(fake.calls, [
+                'planDelete:[["npm","codex"]]',
+                'deleteSelected:[["npm","codex"]]'
+            ])
+            compare(child("upgradeButton").text, "Upgrade усе")
+        }
+
+        function test_delete_cancel_keeps_selection() {
+            check(0)
+            del(0)
+            const dialog = child("confirmDialog")
+            tryVerify(() => dialog.opened)
+            dialog.reject()
+            compare(fake.calls, ['planDelete:[["npm","codex"]]'])
+            compare(child("upgradeButton").text, "Upgrade вибрані (1)")
+        }
+
+        function test_delete_empty_plan_disables_confirm() {
+            fake.deleteRunnable = false
+            check(0)
+            del(0)
+            const dialog = child("confirmDialog")
+            tryVerify(() => dialog.opened)
+            verify(!child("confirmOk").enabled)
+            compare(dialog.title, "Нічого видаляти...")
+        }
+
+        function test_delete_refreshes_rows_and_opens_log() {
+            const panel = child("logPanel")
+            verify(!panel.visible)
+            check(0)
+            del(0)
+            const dialog = child("confirmDialog")
+            tryVerify(() => dialog.opened)
+            dialog.accept()
+            // Фейковий бекенд спочатку зайнятий, потім оновлює рядки.
+            verify(fake.busy)
+            verify(panel.visible)
+            tryVerify(() => child("rowList").count === 3)
+            verify(!fake.busy)
+            compare(fake.log, "- sudo dnf remove codex\n")
         }
     }
 }

@@ -19,6 +19,27 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         .unwrap_or_default()
 }
 
+/// Виконує дібрані команди видалення; після скасування нові не запускає.
+fn run_removals(ctx: &mut Context, commands: Vec<Cmd>) -> Status {
+    let total = commands.len();
+    let mut success = true;
+    let mut done = 0;
+    for cmd in &commands {
+        if ctx.interrupted() {
+            break;
+        }
+        done += 1;
+        success &= ctx.run(cmd);
+    }
+    if done == 0 {
+        Status::Skipped
+    } else if done < total {
+        Status::Failed
+    } else {
+        Status::from_success(success)
+    }
+}
+
 // ---------------------------------------------------------------- DNF
 pub struct Dnf;
 
@@ -106,6 +127,21 @@ impl Source for Dnf {
         Status::from_success(ctx.run(&cmd.args(pick.keys().to_vec())))
     }
 
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        if pick.keys().is_empty() {
+            return Status::Skipped;
+        }
+        let mut cmd = Cmd::new(["sudo", "dnf", "remove"]);
+        if ctx.yes {
+            cmd = cmd.args(["-y"]);
+        }
+        run_removals(ctx, vec![cmd.args(pick.keys().to_vec())])
+    }
+
     fn needs_sudo(&self) -> bool {
         true
     }
@@ -115,6 +151,38 @@ impl Source for Dnf {
 pub struct Flatpak;
 
 const FLATPAK_COLUMNS: &str = "--columns=application,version,name,installation";
+
+/// Розбиває ключі "<інсталяція> <застосунок>" і групує їх: user і system
+/// ніколи не потрапляють в одну команду.
+fn flatpak_uninstall_cmds(keys: &[String], yes: bool) -> Vec<Cmd> {
+    let mut user: Vec<String> = Vec::new();
+    let mut system: Vec<String> = Vec::new();
+    for key in keys {
+        let Some((installation, app)) = key.split_once(' ') else {
+            continue;
+        };
+        let apps = match installation {
+            "user" => &mut user,
+            "system" => &mut system,
+            _ => continue,
+        };
+        if !apps.iter().any(|known| known.as_str() == app) {
+            apps.push(app.to_string());
+        }
+    }
+    let mut commands = Vec::new();
+    for (flag, apps) in [("--user", &user), ("--system", &system)] {
+        if apps.is_empty() {
+            continue;
+        }
+        let mut cmd = Cmd::new(["flatpak", "uninstall", flag]);
+        if yes {
+            cmd = cmd.args(["-y", "--noninteractive"]);
+        }
+        commands.push(cmd.args(apps.iter().cloned()));
+    }
+    commands
+}
 
 impl Source for Flatpak {
     fn id(&self) -> &'static str {
@@ -225,6 +293,15 @@ impl Source for Flatpak {
         }
         Status::from_success(success)
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let commands = flatpak_uninstall_cmds(pick.keys(), ctx.yes);
+        run_removals(ctx, commands)
+    }
 }
 
 // ---------------------------------------------------------------- Homebrew
@@ -234,6 +311,10 @@ fn brew(args: &[&str]) -> Cmd {
     Cmd::new(["brew"])
         .args(args.iter().copied())
         .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+}
+
+fn brew_uninstall_cmd(key: &str) -> Cmd {
+    brew(&["uninstall", key])
 }
 
 impl Source for Brew {
@@ -313,6 +394,15 @@ impl Source for Brew {
             ));
         Status::from_success(success)
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let commands = pick.keys().iter().map(|key| brew_uninstall_cmd(key)).collect();
+        run_removals(ctx, commands)
+    }
 }
 
 // ---------------------------------------------------------------- AppImage
@@ -339,6 +429,16 @@ fn parse_update_line(line: &str) -> Option<Update> {
 }
 
 const APPIMAGE_REGISTRY: &str = ".local/share/app-manager/installations.json";
+
+/// `app-manager uninstall <шлях>` — підтверджено `app-manager --help`.
+/// Шлях лежить у реєстрі (`installed_path` у полі `info`): видаляємо лише
+/// через сам менеджер, а не з файлової системи.
+fn appimage_uninstall_cmds(items: &[Item], keys: &[String]) -> Vec<Cmd> {
+    keys.iter()
+        .filter_map(|key| items.iter().find(|item| &item.key == key || &item.name == key))
+        .map(|item| Cmd::new(["app-manager", "uninstall", item.info.as_str()]))
+        .collect()
+}
 
 impl Source for AppImage {
     fn id(&self) -> &'static str {
@@ -384,6 +484,16 @@ impl Source for AppImage {
             }
         }
         Status::from_success(success)
+    }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let items = self.inventory(ctx, false, false).rows;
+        let commands = appimage_uninstall_cmds(&items, pick.keys());
+        run_removals(ctx, commands)
     }
 }
 
@@ -475,7 +585,119 @@ impl Source for Firmware {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::report::Reporter;
+
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Reporter for Recorder {
+        fn info(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn diagnostic(&self, _: &str) {}
+        fn log(&self, _: &str) {}
+        fn command(&self, line: &str, side: bool) {
+            if !side {
+                self.0.lock().unwrap().push(line.to_string());
+            }
+        }
+        fn failure(&self, _: &str) {}
+        fn captures_output(&self) -> bool {
+            true
+        }
+    }
+
+    /// Команди в режимі --dry-run лише записуються, а не виконуються.
+    fn dry(yes: bool) -> (Context, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let ctx = Context::new("/home/user".into(), true, yes, Box::new(Recorder(lines.clone())));
+        (ctx, lines)
+    }
+
+    fn picked(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    fn commands(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn dnf_remove_uses_sudo_and_only_selected_packages() {
+        let keys = picked(&["vim", "htop"]);
+        let (mut ctx, lines) = dry(true);
+        assert!(Dnf.can_remove());
+        assert!(Dnf.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(commands(&lines), vec!["sudo dnf remove -y vim htop"]);
+
+        let (mut ctx, lines) = dry(false);
+        assert!(Dnf.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(commands(&lines), vec!["sudo dnf remove vim htop"]);
+
+        let (mut ctx, lines) = dry(true);
+        assert!(Dnf.remove(&mut ctx, Pick(None)) == Status::Skipped);
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flatpak_uninstall_never_mixes_installations() {
+        let keys = picked(&[
+            "user org.gnome.Software",
+            "system org.freedesktop.Platform",
+            "user com.spotify.Client",
+            "user org.gnome.Software",
+            "без-інсталяції",
+        ]);
+        let (mut ctx, lines) = dry(true);
+        assert!(Flatpak.can_remove());
+        assert!(Flatpak.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec![
+                "flatpak uninstall --user -y --noninteractive org.gnome.Software com.spotify.Client",
+                "flatpak uninstall --system -y --noninteractive org.freedesktop.Platform",
+            ]
+        );
+
+        let (mut ctx, lines) = dry(false);
+        assert!(Flatpak.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec![
+                "flatpak uninstall --user org.gnome.Software com.spotify.Client",
+                "flatpak uninstall --system org.freedesktop.Platform",
+            ]
+        );
+    }
+
+    #[test]
+    fn brew_remove_uninstalls_only_selected_formulae() {
+        let keys = picked(&["ripgrep", "fd"]);
+        let (mut ctx, lines) = dry(true);
+        assert!(Brew.can_remove());
+        assert!(Brew.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec!["brew uninstall ripgrep", "brew uninstall fd"]
+        );
+    }
+
+    #[test]
+    fn appimage_uninstall_uses_registry_path_for_selected_keys() {
+        let items = vec![
+            Item::new("Foo", "1").info("/home/user/Apps/Foo.AppImage"),
+            Item::new("Bar", "2").info("/home/user/Apps/Bar.AppImage"),
+        ];
+        let keys = picked(&["Foo", "нема"]);
+        let shown: Vec<String> = appimage_uninstall_cmds(&items, &keys)
+            .iter()
+            .map(Cmd::display)
+            .collect();
+        assert_eq!(shown, vec!["app-manager uninstall /home/user/Apps/Foo.AppImage"]);
+        assert!(AppImage.can_remove());
+    }
 
     #[test]
     fn check_upgrade_stops_at_obsoletes() {

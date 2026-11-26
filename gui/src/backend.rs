@@ -55,6 +55,14 @@ pub mod qobject {
 
         #[qinvokable]
         fn upgrade(self: Pin<&mut Backend>, selected: &QString);
+
+        /// Опис того, що зробить `delete`, для вікна підтвердження.
+        #[qinvokable]
+        fn plan_delete(self: &Backend, selected: &QString) -> QString;
+
+        /// `delete` є ключовим словом C++, тому QML бачить `deleteSelected`.
+        #[qinvokable]
+        fn delete_selected(self: Pin<&mut Backend>, selected: &QString);
     }
 
     impl cxx_qt::Threading for Backend {}
@@ -121,6 +129,11 @@ fn dry_run() -> bool {
     std::env::args().any(|arg| arg == "-n" || arg == "--dry-run")
 }
 
+/// Одночасно виконується лише одна робота.
+fn can_start(busy: bool) -> bool {
+    !busy
+}
+
 impl cxx_qt::Initialize for Backend {
     fn initialize(self: Pin<&mut Self>) {
         self.start(Job::Load, "Читаю список установленого…");
@@ -167,7 +180,7 @@ impl Backend {
 
     /// Запускає роботу у фоні. Одночасно виконується лише одна.
     fn start(mut self: Pin<&mut Self>, job: Job, status: &str) {
-        if *self.busy() {
+        if !can_start(*self.busy()) {
             return;
         }
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
@@ -175,8 +188,11 @@ impl Backend {
             return;
         };
         self.as_mut().set_busy(true);
-        self.as_mut()
-            .set_upgrading(matches!(job, Job::Upgrade { .. }));
+        // Вікно закривається лише після завершення будь-якої зміни стану.
+        self.as_mut().set_upgrading(matches!(
+            job,
+            Job::Upgrade { .. } | Job::Delete { .. }
+        ));
         self.as_mut().set_status(QString::from(status));
 
         let screen = self.qt_thread();
@@ -243,5 +259,37 @@ impl Backend {
         };
         let source = self.selected_source();
         self.start(Job::Upgrade { source, selected }, "Оновлюю…");
+    }
+
+    pub fn plan_delete(&self, selected: &QString) -> QString {
+        let Some(selected) = view::selection(&selected.to_string()) else {
+            return QString::from(r#"{"runnable":false,"title":"Помилка вибору","lines":[]}"#);
+        };
+        let catalog = jobs::lock(&self.rust().catalog);
+        QString::from(&view::delete_confirmation(&catalog.deletion_plan(&selected)))
+    }
+
+    pub fn delete_selected(self: Pin<&mut Self>, selected: &QString) {
+        let Some(selected) = view::selection(&selected.to_string()) else {
+            return;
+        };
+        let source = self.selected_source();
+        self.start(Job::Delete { source, selected }, "Видаляю…");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_second_job_is_refused_while_one_is_running() {
+        assert_eq!(super::can_start(true), false);
+        assert_eq!(super::can_start(false), true);
+    }
+
+    #[test]
+    fn broken_selection_never_becomes_an_empty_deletion() {
+        assert_eq!(crate::view::selection("[]"), Some(Vec::new()));
+        assert_eq!(crate::view::selection("not json"), None);
+        assert_eq!(crate::view::selection(r#"[["npm"]]"#), None);
     }
 }

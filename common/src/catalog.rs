@@ -30,6 +30,8 @@ pub struct Row {
     pub latest: String,
     pub info: String,
     pub state: State,
+    /// Чи може джерело видалити цей пакунок власною командою.
+    pub removable: bool,
 }
 
 pub struct Filter<'a> {
@@ -65,6 +67,21 @@ impl Plan {
     }
 }
 
+/// Що зробить кнопка «Delete»: лише обрані пакунки, без усього іншого.
+pub struct DeletionPlan {
+    pub scope: Scope,
+    pub picks: Picks,
+    /// Пакунки для вікна підтвердження.
+    pub preview: Vec<Row>,
+    runnable: bool,
+}
+
+impl DeletionPlan {
+    pub fn is_empty(&self) -> bool {
+        !self.runnable
+    }
+}
+
 struct Entry {
     id: &'static str,
     items: Vec<Item>,
@@ -73,6 +90,7 @@ struct Entry {
 
 impl Entry {
     fn rows(&self) -> Vec<Row> {
+        let removable = sources::removable(self.id);
         let updates: &[Update] = self.check.as_ref().map_or(&[], |check| &check.updates);
         let mut used = vec![false; updates.len()];
         let mut rows: Vec<Row> = self
@@ -97,6 +115,7 @@ impl Entry {
                     latest: update.map(|i| updates[i].latest.clone()).unwrap_or_default(),
                     info: item.info.clone(),
                     state: self.state(&item.key, update.is_some()),
+                    removable,
                 }
             })
             .collect();
@@ -114,6 +133,7 @@ impl Entry {
                     latest: update.latest.clone(),
                     info: update.info.clone(),
                     state: State::Upgradable,
+                    removable,
                 }),
         );
         rows.sort_by_key(|row| row.name.to_lowercase());
@@ -252,6 +272,41 @@ impl Catalog {
             scope,
             picks,
             preview,
+        }
+    }
+
+    /// План видалення: тільки наявні у каталозі рядки, які справді можна
+    /// видалити. Порожній або застарілий вибір не перетворюється на «все».
+    pub fn deletion_plan(&self, selected: &[(String, String)]) -> DeletionPlan {
+        let everything = Filter {
+            source: None,
+            only_upgradable: false,
+            search: "",
+        };
+        let mut picks = Picks::new();
+        let preview: Vec<Row> = self
+            .rows(&everything)
+            .into_iter()
+            .filter(|row| row.removable && row.source != "manual")
+            .filter(|row| {
+                selected
+                    .iter()
+                    .any(|(source, key)| source == row.source && *key == row.key)
+            })
+            .collect();
+        for row in &preview {
+            let keys = picks.entry(row.source).or_default();
+            if !keys.contains(&row.key) {
+                keys.push(row.key.clone());
+            }
+        }
+        // Порожній вибір ядро не повинно тлумачити як «видалити все».
+        let runnable = !picks.is_empty();
+        DeletionPlan {
+            scope: Scope::default(),
+            picks,
+            preview,
+            runnable,
         }
     }
 }
@@ -481,5 +536,41 @@ mod tests {
         // Застарілий вибір (пакунка вже немає) не повинен означати "оновити все".
         let plan = checked().upgrade_plan(None, &selected(&[("npm", "gone")]));
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn rows_declare_which_items_can_be_deleted() {
+        let rows = rows(&sample(), None, false, "");
+        let removable = |source: &str, name: &str| {
+            rows.iter()
+                .find(|row| row.source == source && row.name == name)
+                .unwrap()
+                .removable
+        };
+        assert!(removable("dnf", "bash"));
+        assert!(removable("npm", "codex"));
+        assert!(!removable("tools", "claude"));
+        assert!(!removable("firmware", "SSD"));
+        assert!(!removable("manual", "zed"));
+    }
+
+    #[test]
+    fn deletion_plan_takes_only_selected_removable_items() {
+        let plan = sample().deletion_plan(&selected(&[
+            ("dnf", "bash"),
+            ("tools", "droid"),
+            ("manual", "zed"),
+        ]));
+        assert_eq!(plan.picks["dnf"], ["bash"]);
+        assert_eq!(plan.preview.len(), 1);
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn stale_and_manual_selection_never_deletes_anything() {
+        let catalog = sample();
+        assert!(catalog.deletion_plan(&[]).is_empty());
+        assert!(catalog.deletion_plan(&selected(&[("npm", "gone")])).is_empty());
+        assert!(catalog.deletion_plan(&selected(&[("manual", "zed")])).is_empty());
     }
 }

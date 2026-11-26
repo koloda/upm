@@ -167,6 +167,18 @@ pub trait Source {
 
     fn upgrade(&self, ctx: &mut Context, pick: Pick) -> Status;
 
+    /// Чи вміє джерело видаляти свої пакунки власною командою.
+    /// Джерела без такої команди не видаляють файли самі.
+    fn can_remove(&self) -> bool {
+        false
+    }
+
+    /// Видаляє вибране. Типова реалізація нічого не робить і повідомляє
+    /// `Skipped`; джерела з власною командою перевизначають її.
+    fn remove(&self, _ctx: &mut Context, _pick: Pick) -> Status {
+        Status::Skipped
+    }
+
     /// Чи варто заздалегідь запитати пароль sudo перед повним оновленням.
     fn needs_sudo(&self) -> bool {
         false

@@ -24,6 +24,8 @@ Page {
     property var selected: ({})
     readonly property int selectedCount: Object.keys(selected).length
     readonly property var selectableRows: rows.filter(row => row.source !== "manual")
+    readonly property int removableSelectedCount:
+        selectableRows.filter(row => isSelected(row) && row.removable).length
     readonly property bool allVisibleSelected:
         selectableRows.length > 0 && selectableRows.every(row => isSelected(row))
 
@@ -62,8 +64,16 @@ Page {
     }
 
     function askUpgrade() {
+        confirmDialog.deleteMode = false
         confirmDialog.selection = selectedJson()
         confirmDialog.plan = JSON.parse(backend.planUpgrade(confirmDialog.selection))
+        confirmDialog.open()
+    }
+
+    function askDelete() {
+        confirmDialog.deleteMode = true
+        confirmDialog.selection = selectedJson()
+        confirmDialog.plan = JSON.parse(backend.planDelete(confirmDialog.selection))
         confirmDialog.open()
     }
 
@@ -231,6 +241,8 @@ Page {
                         bottomPadding: 0
                         onClicked: if (selectable) root.toggle(modelData)
 
+                        highlighted: root.isSelected(modelData)
+
                         ToolTip.visible: hovered && modelData.info !== ""
                         ToolTip.delay: 600
                         ToolTip.text: modelData.info
@@ -323,6 +335,14 @@ Page {
                         && (root.selectedCount > 0 || root.currentSource !== "manual")
                     onClicked: root.askUpgrade()
                 }
+                Button {
+                    objectName: "deleteSelectedButton"
+                    text: root.removableSelectedCount > 0
+                        ? "Видалити вибрані (" + root.removableSelectedCount + ")"
+                        : "Видалити вибрані"
+                    enabled: !root.backend.busy && root.removableSelectedCount > 0
+                    onClicked: root.askDelete()
+                }
             }
         }
     }
@@ -332,6 +352,7 @@ Page {
         objectName: "confirmDialog"
 
         property string selection: "[]"
+        property bool deleteMode: false
         property var plan: ({ runnable: false, title: "", lines: [] })
 
         modal: true
@@ -341,7 +362,10 @@ Page {
         title: plan.title
 
         onAccepted: {
-            root.backend.upgrade(selection)
+            if (confirmDialog.deleteMode)
+                root.backend.deleteSelected(selection)
+            else
+                root.backend.upgrade(selection)
             root.selected = ({})
         }
 
@@ -360,8 +384,8 @@ Page {
         footer: DialogButtonBox {
             Button {
                 objectName: "confirmOk"
-                text: "Оновити"
-                enabled: confirmDialog.plan.runnable
+                text: confirmDialog.deleteMode ? "Видалити" : "Оновити"
+                enabled: confirmDialog.plan.runnable === true
                 DialogButtonBox.buttonRole: DialogButtonBox.AcceptRole
             }
             Button {

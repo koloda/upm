@@ -13,6 +13,39 @@ fn basename(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+/// Виконує дібрані команди видалення; після скасування нові не запускає.
+fn run_removals(ctx: &mut Context, commands: Vec<Cmd>) -> Status {
+    run_removals_at(
+        ctx,
+        commands.into_iter().map(|cmd| (None, cmd)).collect(),
+    )
+}
+
+/// Якщо каталог встановлення не writable (наприклад, `/usr/local`), команда
+/// виконується через `sudo` — так само, як оновлення того ж пакунка.
+fn run_removals_at(ctx: &mut Context, jobs: Vec<(Option<PathBuf>, Cmd)>) -> Status {
+    let total = jobs.len();
+    let mut success = true;
+    let mut done = 0;
+    for (dir, cmd) in jobs {
+        if ctx.interrupted() {
+            break;
+        }
+        done += 1;
+        success &= match dir {
+            Some(dir) => ctx.run_in_dir(&dir, cmd),
+            None => ctx.run(&cmd),
+        };
+    }
+    if done == 0 {
+        Status::Skipped
+    } else if done < total {
+        Status::Failed
+    } else {
+        Status::from_success(success)
+    }
+}
+
 // ---------------------------------------------------------------- Node.js (global)
 pub struct Npm;
 
@@ -80,6 +113,56 @@ fn npm_latest(ctx: &Context, name: &str) -> Option<String> {
     let result = ctx.capture(&Cmd::new(["npm", "view", name, "version"]).quiet());
     let latest = result.stdout.trim().to_string();
     (result.ok() && !latest.is_empty()).then_some(latest)
+}
+
+/// Префікс з інвентаря (`info`) визначає, де саме встановлено пакунок.
+/// Разом із командою повертаємо каталог, щоб `run_removals_at` міг підвищити
+/// права, коли цей префікс належить root (наприклад, `/usr/local`).
+fn npm_uninstall_cmds(items: &[Item], keys: &[String]) -> Vec<(Option<PathBuf>, Cmd)> {
+    keys.iter()
+        .filter_map(|key| items.iter().find(|item| &item.name == key || &item.key == key))
+        .map(|item| {
+            let dir = (!item.info.is_empty()).then(|| PathBuf::from(&item.info));
+            (
+                dir,
+                Cmd::new(["npm", "uninstall", "-g", "--prefix"])
+                    .args([item.info.as_str(), item.name.as_str()]),
+            )
+        })
+        .collect()
+}
+
+/// pnpm і bun мають власні глобальні сховища: команду додаємо лише тоді,
+/// коли пакунок справді належить відповідному менеджеру.
+fn npm_mirror_uninstalls(home: &Path, names: &[String], pnpm: bool, bun: bool) -> Vec<Cmd> {
+    let mut commands = Vec::new();
+    let unique: BTreeSet<&String> = names.iter().collect();
+    if pnpm {
+        let global = home.join(".local/share/pnpm/global");
+        let mut stores = vec![global.clone()];
+        stores.extend(list_dir(&global));
+        for name in &unique {
+            if stores.iter().any(|store| store.join("node_modules").join(name).is_dir()) {
+                commands.push(Cmd::new(["pnpm", "uninstall", "-g", name.as_str()]));
+            }
+        }
+    }
+    if bun {
+        let manifest = home.join(".bun/install/global/package.json");
+        let owned: BTreeSet<String> = std::fs::read_to_string(manifest)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|json| json.get("dependencies").cloned())
+            .and_then(|deps| deps.as_object().cloned())
+            .map(|deps| deps.keys().cloned().collect())
+            .unwrap_or_default();
+        for name in &unique {
+            if owned.contains(name.as_str()) {
+                commands.push(Cmd::new(["bun", "uninstall", "-g", name.as_str()]));
+            }
+        }
+    }
+    commands
 }
 
 impl Source for Npm {
@@ -178,6 +261,27 @@ impl Source for Npm {
         Status::from_success(success)
     }
 
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let items = self.inventory(ctx, false, false).rows;
+        let names: Vec<String> = items
+            .iter()
+            .filter(|item| pick.has(&item.name))
+            .map(|item| item.name.clone())
+            .collect();
+        let mut commands = npm_uninstall_cmds(&items, pick.keys());
+        commands.extend(npm_mirror_uninstalls(
+            &ctx.home,
+            &names,
+            ctx.have("pnpm"),
+            ctx.have("bun"),
+        ).into_iter().map(|cmd| (None, cmd)));
+        run_removals_at(ctx, commands)
+    }
+
     fn needs_sudo(&self) -> bool {
         true
     }
@@ -196,6 +300,13 @@ fn composer_json(ctx: &Context, action: &str, all: bool) -> Option<Vec<Value>> {
     // Порожній глобальний проєкт дає порожній вивід або [].
     let data: Value = serde_json::from_str(&output).unwrap_or_default();
     Some(data["installed"].as_array().cloned().unwrap_or_default())
+}
+
+fn composer_remove_cmds(keys: &[String]) -> Vec<Cmd> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    vec![Cmd::new(["composer", "global", "remove"]).args(keys.iter().cloned())]
 }
 
 impl Source for Composer {
@@ -248,6 +359,15 @@ impl Source for Composer {
             success &= ctx.run(&Cmd::new(["composer", "global", "outdated", "--direct"]));
         }
         Status::from_success(success)
+    }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let commands = composer_remove_cmds(pick.keys());
+        run_removals(ctx, commands)
     }
 }
 
@@ -463,6 +583,19 @@ fn cargo_crates(ctx: &Context) -> Vec<Crate> {
     parse_crates(&ctx.read(&query).unwrap_or_default())
 }
 
+fn rust_uninstall_cmds(keys: &[String]) -> Vec<Cmd> {
+    keys.iter()
+        .filter_map(|key| {
+            if let Some(toolchain) = key.strip_prefix("toolchain:") {
+                (!toolchain.is_empty())
+                    .then(|| Cmd::new(["rustup", "toolchain", "uninstall", toolchain]))
+            } else {
+                (!key.is_empty()).then(|| Cmd::new(["cargo", "uninstall", key.as_str()]))
+            }
+        })
+        .collect()
+}
+
 impl Source for Rust {
     fn id(&self) -> &'static str {
         "rust"
@@ -595,6 +728,15 @@ impl Source for Rust {
         }
         Status::from_success(success)
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let commands = rust_uninstall_cmds(pick.keys());
+        run_removals(ctx, commands)
+    }
 }
 
 // ---------------------------------------------------------------- Python
@@ -703,6 +845,37 @@ fn joined_names(dists: &[Dist]) -> String {
         .map(|dist| dist.name.as_str())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `orphan:` належить Python, якого вже немає, — таке не видаляємо.
+fn python_uninstall_cmds(keys: &[String]) -> Vec<Cmd> {
+    let mut commands = Vec::new();
+    let unique: BTreeSet<&String> = keys.iter().collect();
+    for key in unique {
+        let Some((kind, name)) = key.split_once(':') else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        match kind {
+            "pip" => {
+                let name = normalize(name);
+                commands.push(Cmd::new([
+                    "python3",
+                    "-m",
+                    "pip",
+                    "uninstall",
+                    "-y",
+                    name.as_str(),
+                ]));
+            }
+            "uv" => commands.push(Cmd::new(["uv", "tool", "uninstall", name])),
+            "pipx" => commands.push(Cmd::new(["pipx", "uninstall", name])),
+            _ => {}
+        }
+    }
+    commands
 }
 
 impl Source for Python {
@@ -891,11 +1064,189 @@ impl Source for Python {
         }
         Status::from_success(success)
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let commands = python_uninstall_cmds(pick.keys());
+        run_removals(ctx, commands)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::report::Reporter;
+
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Reporter for Recorder {
+        fn info(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn diagnostic(&self, _: &str) {}
+        fn log(&self, _: &str) {}
+        fn command(&self, line: &str, side: bool) {
+            if !side {
+                self.0.lock().unwrap().push(line.to_string());
+            }
+        }
+        fn failure(&self, _: &str) {}
+        fn captures_output(&self) -> bool {
+            true
+        }
+    }
+
+    /// Команди в режимі --dry-run лише записуються, а не виконуються.
+    fn dry() -> (Context, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let ctx = Context::new("/home/user".into(), true, true, Box::new(Recorder(lines.clone())));
+        (ctx, lines)
+    }
+
+    fn picked(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    fn commands(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    fn temp_home(tag: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "upm-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn npm_uninstall_uses_inventory_prefix_for_selected_names() {
+        let items = vec![
+            Item::new("typescript", "5.9").info("/usr/local"),
+            Item::new("prettier", "3").info("/home/user/.npm-global"),
+        ];
+        let keys = picked(&["typescript", "нема"]);
+        let shown: Vec<String> = npm_uninstall_cmds(&items, &keys)
+            .iter()
+            .map(|(_, cmd)| cmd.display())
+            .collect();
+        assert_eq!(shown, vec!["npm uninstall -g --prefix /usr/local typescript"]);
+        assert!(Npm.can_remove());
+    }
+
+    #[test]
+    fn removal_from_a_root_owned_prefix_runs_through_sudo() {
+        if crate::running_as_root() {
+            return; // root can write anywhere, so no elevation is needed
+        }
+        let home = temp_home("npm-sudo");
+        let locked = home.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let (mut ctx, lines) = dry();
+        let jobs = vec![(
+            Some(locked.clone()),
+            Cmd::new(["npm", "uninstall", "-g", "--prefix"])
+                .args([locked.display().to_string(), "gemini".to_string()]),
+        )];
+        assert!(run_removals_at(&mut ctx, jobs) == Status::Ok);
+        let shown = commands(&lines);
+        assert_eq!(
+            shown,
+            vec![format!(
+                "sudo npm uninstall -g --prefix {} gemini",
+                locked.display()
+            )]
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn npm_mirrors_are_uninstalled_only_when_owned() {
+        let home = temp_home("npm");
+        std::fs::create_dir_all(home.join(".local/share/pnpm/global/v10/node_modules/foo"))
+            .unwrap();
+        std::fs::create_dir_all(home.join(".bun/install/global")).unwrap();
+        std::fs::write(
+            home.join(".bun/install/global/package.json"),
+            r#"{"dependencies":{"bar":"^1.0"}}"#,
+        )
+        .unwrap();
+        let names = picked(&["foo", "bar", "baz"]);
+        let shown: Vec<String> = npm_mirror_uninstalls(&home, &names, true, true)
+            .iter()
+            .map(Cmd::display)
+            .collect();
+        assert_eq!(shown, vec!["pnpm uninstall -g foo", "bun uninstall -g bar"]);
+        assert!(npm_mirror_uninstalls(&home, &names, false, false).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn composer_remove_uses_global_with_selected_names() {
+        let keys = picked(&["psr/log", "phpunit/phpunit"]);
+        let (mut ctx, lines) = dry();
+        assert!(Composer.can_remove());
+        assert!(Composer.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec!["composer global remove psr/log phpunit/phpunit"]
+        );
+
+        let (mut ctx, lines) = dry();
+        assert!(Composer.remove(&mut ctx, Pick(None)) == Status::Skipped);
+        assert!(lines.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rust_remove_distinguishes_toolchains_and_crates() {
+        let keys = picked(&["toolchain:stable", "ripgrep", "toolchain:1.84.0"]);
+        let (mut ctx, lines) = dry();
+        assert!(Rust.can_remove());
+        assert!(Rust.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec![
+                "rustup toolchain uninstall stable",
+                "cargo uninstall ripgrep",
+                "rustup toolchain uninstall 1.84.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn python_remove_skips_orphans_and_normalizes_names() {
+        let keys = picked(&[
+            "pip:Tree_Sitter.C-Sharp",
+            "uv:ruff",
+            "pipx:black",
+            "orphan:old",
+            "pip:",
+        ]);
+        let (mut ctx, lines) = dry();
+        assert!(Python.can_remove());
+        assert!(Python.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec![
+                "python3 -m pip uninstall -y tree-sitter-c-sharp",
+                "pipx uninstall black",
+                "uv tool uninstall ruff",
+            ]
+        );
+    }
 
     #[test]
     fn crates_distinguish_registry_from_git() {

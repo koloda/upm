@@ -26,6 +26,12 @@ pub fn all() -> Vec<Box<dyn Source>> {
     ]
 }
 
+/// Чи може джерело видаляти свої пакунки (без запуску будь-якої команди).
+/// Використовується планом видалення, щоб не пропонувати неможливе.
+pub fn removable(id: &str) -> bool {
+    all().iter().any(|source| source.id() == id && source.can_remove())
+}
+
 pub const NAMES: [&str; 15] = [
     "dnf", "flatpak", "brew", "appimage", "npm", "composer", "go", "rust", "python", "tools",
     "sdkman", "android", "shell", "firmware", "manual",

@@ -6,6 +6,27 @@ use crate::context::{Cmd, Context, file_name, is_executable, list_dir};
 use crate::source::{Item, Pick, Query, Source, Status, Update};
 use crate::version::is_newer;
 
+/// Виконує дібрані команди видалення; після скасування нові не запускає.
+fn run_removals(ctx: &mut Context, commands: Vec<Cmd>) -> Status {
+    let total = commands.len();
+    let mut success = true;
+    let mut done = 0;
+    for cmd in &commands {
+        if ctx.interrupted() {
+            break;
+        }
+        done += 1;
+        success &= ctx.run(cmd);
+    }
+    if done == 0 {
+        Status::Skipped
+    } else if done < total {
+        Status::Failed
+    } else {
+        Status::from_success(success)
+    }
+}
+
 // ---------------------------------------------------------------- Програми з власним оновлювачем
 pub struct Tools;
 
@@ -267,6 +288,30 @@ fn sdk(ctx: &Context, args: &[&str]) -> Cmd {
         .interactive()
 }
 
+/// Версію кандидата беремо з посилання `current` у каталозі кандидатів.
+fn sdk_currents(ctx: &Context) -> Vec<(String, String)> {
+    list_dir(&ctx.in_home(".sdkman/candidates"))
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .filter_map(|dir| {
+            let version = std::fs::read_link(dir.join("current"))
+                .ok()
+                .map(|target| file_name(&target))?;
+            Some((file_name(&dir), version))
+        })
+        .collect()
+}
+
+/// Синтаксис `sdk uninstall <candidate> <version>` підтверджено `sdk help`
+/// на цій машині; без встановленої версії команду не запускаємо.
+fn sdk_uninstall_cmds(ctx: &Context, keys: &[String]) -> Vec<Cmd> {
+    let currents = sdk_currents(ctx);
+    keys.iter()
+        .filter_map(|key| currents.iter().find(|(name, _)| name == key))
+        .map(|(name, version)| sdk(ctx, &["uninstall", name, version]))
+        .collect()
+}
+
 impl Source for Sdkman {
     fn id(&self) -> &'static str {
         "sdkman"
@@ -367,6 +412,15 @@ impl Source for Sdkman {
         }
         Status::from_success(success)
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let commands = sdk_uninstall_cmds(ctx, pick.keys());
+        run_removals(ctx, commands)
+    }
 }
 
 // ---------------------------------------------------------------- Android SDK
@@ -426,6 +480,14 @@ fn sdk_packages(ctx: &Context, mode: &str) -> Option<Vec<SdkPackage>> {
     ctx.read(&query).map(|text| parse_sdk_packages(&text))
 }
 
+/// `sdkmanager --uninstall` підтверджено `sdkmanager --help`; ключ інвентаря
+/// уже є шляхом встановленого пакета.
+fn android_uninstall_cmd(manager: &std::path::Path, key: &str) -> Cmd {
+    Cmd::new([manager.display().to_string()])
+        .args(["--uninstall", key])
+        .interactive()
+}
+
 impl Source for Android {
     fn id(&self) -> &'static str {
         "android"
@@ -470,6 +532,20 @@ impl Source for Android {
         };
         Status::from_success(ctx.run(&cmd))
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let manager = sdkmanager(ctx);
+        let commands = pick
+            .keys()
+            .iter()
+            .map(|key| android_uninstall_cmd(&manager, key))
+            .collect();
+        run_removals(ctx, commands)
+    }
 }
 
 // ---------------------------------------------------------------- Плагіни fish і розширення gh
@@ -481,6 +557,28 @@ fn has_fisher(ctx: &Context) -> bool {
 
 fn has_gh_extensions(ctx: &Context) -> bool {
     ctx.have("gh") && !list_dir(&ctx.in_home(".local/share/gh/extensions")).is_empty()
+}
+
+/// Назва потрапляє в командний рядок fish, тож дозволяємо лише безпечні символи.
+fn shell_uninstall_cmd(key: &str) -> Option<Cmd> {
+    let (kind, name) = key.split_once(':')?;
+    let safe = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "._@/~-".contains(c));
+    if name.is_empty() || !safe {
+        return None;
+    }
+    match kind {
+        "fisher" => {
+            let script = format!("fisher remove {name}");
+            Some(Cmd::new(["fish", "-c", script.as_str()]))
+        }
+        "gh" => {
+            let short = name.rsplit('/').next().unwrap_or(name);
+            Some(Cmd::new(["gh", "extension", "remove", short]))
+        }
+        _ => None,
+    }
 }
 
 impl Source for Shell {
@@ -587,6 +685,22 @@ impl Source for Shell {
         }
         Status::from_success(success)
     }
+
+    fn can_remove(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+        let mut commands = Vec::new();
+        for key in pick.keys() {
+            if let Some(cmd) = shell_uninstall_cmd(key) {
+                commands.push(cmd);
+            } else {
+                ctx.note(format!("не можу безпечно видалити: {key}"));
+            }
+        }
+        run_removals(ctx, commands)
+    }
 }
 
 // ---------------------------------------------------------------- Оновлюється вручну
@@ -660,7 +774,131 @@ impl Source for Manual {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+    use crate::report::Reporter;
+
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Reporter for Recorder {
+        fn info(&self, _: &str) {}
+        fn warn(&self, _: &str) {}
+        fn diagnostic(&self, _: &str) {}
+        fn log(&self, _: &str) {}
+        fn command(&self, line: &str, side: bool) {
+            if !side {
+                self.0.lock().unwrap().push(line.to_string());
+            }
+        }
+        fn failure(&self, _: &str) {}
+        fn captures_output(&self) -> bool {
+            true
+        }
+    }
+
+    /// Команди в режимі --dry-run лише записуються, а не виконуються.
+    fn dry() -> (Context, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let ctx = Context::new("/home/user".into(), true, true, Box::new(Recorder(lines.clone())));
+        (ctx, lines)
+    }
+
+    fn picked(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    fn commands(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        lines.lock().unwrap().clone()
+    }
+
+    fn temp_home(tag: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "upm-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn sdkman_uninstall_uses_current_version_from_symlink() {
+        let home = temp_home("sdkman");
+        let candidate = home.join(".sdkman/candidates/java");
+        std::fs::create_dir_all(&candidate).unwrap();
+        symlink("21.0.2", candidate.join("current")).unwrap();
+        let (mut ctx, lines) = dry();
+        ctx.home = home.clone();
+        let keys = picked(&["java", "gradle"]);
+        assert!(Sdkman.can_remove());
+        assert!(Sdkman.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec![format!(
+                "bash -c source \"$1\"; shift; sdk \"$@\" _ {} uninstall java 21.0.2",
+                ctx.in_home(SDKMAN_INIT).display()
+            )]
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn android_uninstall_uses_installed_package_ids() {
+        let keys = picked(&["platform-tools", "build-tools/35.0.0"]);
+        let (mut ctx, lines) = dry();
+        assert!(Android.can_remove());
+        assert!(Android.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        let manager = sdkmanager(&ctx).display().to_string();
+        assert_eq!(
+            commands(&lines),
+            vec![
+                format!("{manager} --uninstall platform-tools"),
+                format!("{manager} --uninstall build-tools/35.0.0"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_uninstall_commands_use_fisher_and_gh_extensions() {
+        let keys = picked(&[
+            "fisher:jorgebutler/fisher",
+            "gh:cli/cli",
+            "fisher:bad;name",
+            "інше:x",
+        ]);
+        let (mut ctx, lines) = dry();
+        assert!(Shell.can_remove());
+        assert!(Shell.remove(&mut ctx, Pick(Some(&keys))) == Status::Ok);
+        assert_eq!(
+            commands(&lines),
+            vec![
+                "fish -c fisher remove jorgebutler/fisher",
+                "gh extension remove cli",
+            ]
+        );
+        assert!(shell_uninstall_cmd("fisher:bad;name").is_none());
+    }
+
+    #[test]
+    fn non_removable_sources_never_run_a_command() {
+        let keys = picked(&["anything"]);
+        let (mut ctx, lines) = dry();
+        let mut seen = 0;
+        for source in crate::sources::all() {
+            if ["go", "tools", "firmware", "manual"].contains(&source.id()) {
+                seen += 1;
+                assert!(!source.can_remove());
+                assert!(source.remove(&mut ctx, Pick(Some(&keys))) == Status::Skipped);
+            }
+        }
+        assert_eq!(seen, 4);
+        assert!(lines.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn versions_are_found_in_tool_output() {

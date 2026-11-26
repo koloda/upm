@@ -340,6 +340,61 @@ pub fn upgrade(
     summary
 }
 
+// ---------------------------------------------------------------- видалення
+/// Видаляє тільки явно вибране. На відміну від `upgrade`, порожній вибір
+/// ніколи не означає «все»: джерела без власної команди видалення
+/// пропускаються, а не видаляють файли самі.
+pub fn remove(
+    ctx: &mut Context,
+    scope: &Scope,
+    picks: &Picks,
+    sources: &Sources,
+    mut on_start: impl FnMut(&mut Context, &'static str),
+) -> Summary {
+    if picks.is_empty() {
+        return Summary::default();
+    }
+    let needs_sudo = sources.iter().any(|source| {
+        source.can_remove()
+            && source.needs_sudo()
+            && scope.is_active(picks, source.id())
+            && picks
+                .get(source.id())
+                .is_some_and(|keys| !keys.is_empty())
+    });
+    if !ctx.dry && needs_sudo {
+        keep_sudo(ctx);
+    }
+
+    let mut summary = Summary::default();
+    for source in sources {
+        let id = source.id();
+        if ctx.interrupted() {
+            break;
+        }
+        // Видалення завжди цільове: лише ключі, що є в плані.
+        if !picks.get(id).is_some_and(|keys| !keys.is_empty())
+            || !scope.is_active(picks, id)
+            || !source.can_remove()
+        {
+            continue;
+        }
+        on_start(ctx, id);
+        let status = if source.available(ctx) {
+            source.remove(ctx, pick(picks, id))
+        } else {
+            Status::Skipped
+        };
+        match status {
+            Status::Ok => summary.ok.push(id),
+            Status::Skipped => summary.skipped.push(id),
+            Status::Failed => summary.failed.push(id),
+        }
+    }
+    summary.interrupted = ctx.interrupted();
+    summary
+}
+
 // ---------------------------------------------------------------- Ручне оновлення
 /// Те, що не оновлюється автоматично.
 pub struct ManualReport {
@@ -535,5 +590,100 @@ mod tests {
             &sources,
             |_, _| {}
         ));
+    }
+
+    /// Джерело з власною командою видалення; знає лише ключ `one`.
+    struct Removable(&'static str, Arc<Mutex<Vec<String>>>, Status);
+
+    impl Source for Removable {
+        fn id(&self) -> &'static str {
+            self.0
+        }
+        fn available(&self, _: &Context) -> bool {
+            true
+        }
+        fn inventory(&self, _: &mut Context, _: bool, _: bool) -> Query<Item> {
+            vec![Item::new("one", "1")].into()
+        }
+        fn outdated(&self, _: &mut Context, _: Pick) -> Query<Update> {
+            Query::new()
+        }
+        fn upgrade(&self, _: &mut Context, _: Pick) -> Status {
+            Status::Ok
+        }
+        fn can_remove(&self) -> bool {
+            true
+        }
+        fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+            for key in pick.keys() {
+                if key == "one" {
+                    self.1.lock().unwrap().push(format!("{}:{key}", self.0));
+                    // dry-run: команда лише показується, не виконується.
+                    ctx.run(&Cmd::new(["uninstall-stub", key]));
+                }
+            }
+            self.2
+        }
+    }
+
+    fn removing(
+        status: Status,
+    ) -> (Context, Scope, Vec<Box<dyn Source>>, Arc<Mutex<Vec<String>>>) {
+        let (ctx, scope, _, _) = setup(&[]);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(Removable("npm", calls.clone(), status))];
+        (ctx, scope, sources, calls)
+    }
+
+    #[test]
+    fn remove_touches_only_selected_keys() {
+        let (mut ctx, scope, sources, calls) = removing(Status::Ok);
+        let picks = Picks::from([("npm", vec!["one".to_string()])]);
+        let summary = remove(&mut ctx, &scope, &picks, &sources, |_, _| {});
+        assert_eq!(*calls.lock().unwrap(), ["npm:one"]);
+        assert_eq!(summary.ok, ["npm"]);
+        assert!(!summary.interrupted);
+    }
+
+    #[test]
+    fn remove_reports_skipped_and_failed() {
+        for (status, field) in [(Status::Skipped, 0), (Status::Failed, 1)] {
+            let (mut ctx, scope, sources, _) = removing(status);
+            let picks = Picks::from([("npm", vec!["one".to_string()])]);
+            let summary = remove(&mut ctx, &scope, &picks, &sources, |_, _| {});
+            let counts = [summary.skipped.len(), summary.failed.len()];
+            assert_eq!(counts[field], 1);
+        }
+    }
+
+    #[test]
+    fn stale_or_empty_selection_runs_no_commands() {
+        let (mut ctx, scope, sources, calls) = removing(Status::Ok);
+        let summary = remove(&mut ctx, &scope, &Picks::new(), &sources, |_, _| {});
+        assert!(summary.ok.is_empty() && summary.failed.is_empty());
+        let stale = Picks::from([("npm", vec!["gone".to_string()])]);
+        remove(&mut ctx, &scope, &stale, &sources, |_, _| {});
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sources_without_removal_are_never_called() {
+        let (mut ctx, scope, _, _) = setup(&[]);
+        let sources: Vec<Box<dyn Source>> = vec![Box::new(Other)];
+        let picks = Picks::from([("go", vec!["one".to_string()])]);
+        let summary = remove(&mut ctx, &scope, &picks, &sources, |_, _| {});
+        assert!(summary.ok.is_empty() && summary.failed.is_empty());
+        assert!(ctx.failed_commands.is_empty());
+    }
+
+    #[test]
+    fn cancelled_removal_stops_before_the_first_item() {
+        let (mut ctx, scope, sources, calls) = removing(Status::Ok);
+        ctx.cancel_flag()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let picks = Picks::from([("npm", vec!["one".to_string()])]);
+        let summary = remove(&mut ctx, &scope, &picks, &sources, |_, _| {});
+        assert!(summary.interrupted);
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

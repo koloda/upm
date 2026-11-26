@@ -20,6 +20,11 @@ pub enum Job {
         source: Option<String>,
         selected: Vec<(String, String)>,
     },
+    /// Видалення лише обраних пакунків.
+    Delete {
+        source: Option<String>,
+        selected: Vec<(String, String)>,
+    },
 }
 
 pub struct Outcome {
@@ -62,7 +67,7 @@ pub fn run(
                 ctx.log(&format!("\n==> {}\n", view::title(id)));
                 changed();
             });
-            let status = report(ctx, &summary);
+            let status = report(ctx, &summary, "Оновлення");
             // Перечитуємо лише те, що чіпали.
             let touched = [summary.ok, summary.failed].concat();
             if !touched.is_empty() {
@@ -71,6 +76,32 @@ pub fn run(
             Outcome {
                 status,
                 only_upgradable: Some(false),
+            }
+        }
+        Job::Delete { source, selected } => {
+            let _ = source; // джерело вже закодоване у вибраних парах
+            let plan = lock(catalog).deletion_plan(&selected);
+            if plan.is_empty() {
+                return Outcome {
+                    status: "Нічого видаляти".to_string(),
+                    only_upgradable: None,
+                };
+            }
+            let summary = engine::remove(ctx, &plan.scope, &plan.picks, sources, |ctx, id| {
+                ctx.log(&format!("\n==> {}\n", view::title(id)));
+                changed();
+            });
+            let status = report(ctx, &summary, "Видалення");
+            // Після dry-run нічого не змінилося, перечитувати нема чого.
+            if !ctx.dry {
+                let touched = [summary.ok, summary.failed].concat();
+                if !touched.is_empty() {
+                    load(ctx, touched, sources, catalog, changed);
+                }
+            }
+            Outcome {
+                status,
+                only_upgradable: None,
             }
         }
     }
@@ -133,7 +164,7 @@ fn check(
 }
 
 /// Пише підсумок у журнал і повертає короткий статус.
-fn report(ctx: &mut Context, summary: &Summary) -> String {
+fn report(ctx: &mut Context, summary: &Summary, action: &str) -> String {
     for command in &ctx.failed_commands {
         ctx.log(&format!("✗ {command}\n"));
     }
@@ -141,13 +172,10 @@ fn report(ctx: &mut Context, summary: &Summary) -> String {
         ctx.log(&format!("• {note}\n"));
     }
     if summary.failed.is_empty() {
-        "Оновлення завершено".to_string()
+        format!("{action} завершено")
     } else {
         let failed: Vec<&str> = summary.failed.iter().map(|id| view::title(id)).collect();
-        format!(
-            "Оновлення з помилками: {}. Деталі в журналі",
-            failed.join(", ")
-        )
+        format!("{action} з помилками: {}. Деталі в журналі", failed.join(", "))
     }
 }
 
@@ -156,7 +184,7 @@ mod tests {
     use std::sync::Mutex;
 
     use upm_common::catalog::Filter;
-    use upm_common::context::Context;
+    use upm_common::context::{Cmd, Context};
     use upm_common::report::Reporter;
     use upm_common::source::{Item, Pick, Query, Source, Status, Update};
 
@@ -180,8 +208,12 @@ mod tests {
         fn failure(&self, _: &str) {}
     }
 
-    /// Джерело, яке записує, що саме його просили оновити.
-    struct Fake(&'static str, std::sync::Arc<Mutex<Vec<String>>>);
+    /// Джерело, яке записує, що саме його просили оновити чи видалити.
+    struct Fake(
+        &'static str,
+        std::sync::Arc<Mutex<Vec<String>>>,
+        std::sync::Arc<Mutex<Vec<String>>>,
+    );
 
     impl Source for Fake {
         fn id(&self) -> &'static str {
@@ -203,6 +235,18 @@ mod tests {
                 .push(format!("{}:{}", self.0, pick.keys().join(",")));
             Status::Ok
         }
+        fn can_remove(&self) -> bool {
+            true
+        }
+        fn remove(&self, ctx: &mut Context, pick: Pick) -> Status {
+            self.2
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", self.0, pick.keys().join(",")));
+            // dry-run: команда лише показується.
+            ctx.run(&Cmd::new(["uninstall-stub"]));
+            Status::Ok
+        }
     }
 
     struct Fixture {
@@ -210,20 +254,23 @@ mod tests {
         sources: Vec<Box<dyn Source>>,
         catalog: Mutex<Catalog>,
         upgraded: std::sync::Arc<Mutex<Vec<String>>>,
+        deleted: std::sync::Arc<Mutex<Vec<String>>>,
     }
 
     impl Fixture {
         fn new() -> Self {
             let upgraded = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let deleted = std::sync::Arc::new(Mutex::new(Vec::new()));
             Fixture {
                 // dry = true: жодного sudo.
                 ctx: Context::new("/nonexistent".into(), true, true, Box::new(Log::default())),
                 sources: vec![
-                    Box::new(Fake("npm", upgraded.clone())),
-                    Box::new(Fake("go", upgraded.clone())),
+                    Box::new(Fake("npm", upgraded.clone(), deleted.clone())),
+                    Box::new(Fake("go", upgraded.clone(), deleted.clone())),
                 ],
                 catalog: Mutex::new(Catalog::default()),
                 upgraded,
+                deleted,
             }
         }
 
@@ -286,5 +333,46 @@ mod tests {
             selected: vec![("npm".into(), "gone".into())],
         });
         assert!(fixture.upgraded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deletion_reloads_only_touched_sources() {
+        let mut fixture = Fixture::new();
+        fixture.ctx.dry = false;
+        fixture.run(Job::Load);
+        fixture.run(Job::Check { source: None });
+        let outcome = fixture.run(Job::Delete {
+            source: None,
+            selected: vec![("npm".into(), "one".into())],
+        });
+        assert_eq!(*fixture.deleted.lock().unwrap(), ["npm:one"]);
+        // npm перечитано (перевірка скинута), результат перевірки go зберігся.
+        assert_eq!(fixture.upgradable(), ["go"]);
+        assert!(outcome.status.contains("Видалення"));
+    }
+
+    #[test]
+    fn dry_deletion_leaves_the_inventory_untouched() {
+        let mut fixture = Fixture::new();
+        fixture.run(Job::Load);
+        fixture.run(Job::Check { source: None });
+        fixture.run(Job::Delete {
+            source: None,
+            selected: vec![("npm".into(), "one".into())],
+        });
+        assert_eq!(*fixture.deleted.lock().unwrap(), ["npm:one"]);
+        assert_eq!(fixture.upgradable(), ["npm", "go"]);
+    }
+
+    #[test]
+    fn stale_or_empty_selection_deletes_nothing() {
+        let mut fixture = Fixture::new();
+        fixture.run(Job::Load);
+        let outcome = fixture.run(Job::Delete {
+            source: None,
+            selected: vec![("npm".into(), "gone".into())],
+        });
+        assert!(fixture.deleted.lock().unwrap().is_empty());
+        assert_eq!(outcome.status, "Нічого видаляти");
     }
 }
