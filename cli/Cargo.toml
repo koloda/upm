@@ -1,0 +1,13 @@
+[package]
+name = "upm-cli"
+description = "Інтерфейс командного рядка UPM"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "upm"
+path = "src/main.rs"
+
+[dependencies]
+upm-common.workspace = true
+signal-hook.workspace = true

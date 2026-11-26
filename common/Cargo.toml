@@ -1,0 +1,8 @@
+[package]
+name = "upm-common"
+description = "Спільна логіка UPM для CLI та графічного інтерфейсу"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json.workspace = true

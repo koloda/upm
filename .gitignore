@@ -1,0 +1,25 @@
+# Rust / Cargo build output (includes cxx-qt generated files under target/)
+/target/
+**/target/
+
+# Local Claude Code settings (shared project settings stay tracked)
+.claude/settings.local.json
+.claude/*.local.*
+
+# Local tool state
+.opencode/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and environment files
+*.log
+.env
+.env.*
+!.env.example
+graphify-out/

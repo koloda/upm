@@ -1,0 +1,12 @@
+[workspace]
+members = ["common", "cli", "gui"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+upm-common = { path = "common" }
+serde_json = "1.0.154"
+signal-hook = "0.4.6"
